@@ -1,0 +1,37 @@
+# ─────────────────────────────────────────────
+#  Jarvis – Voice AI Assistant
+#  requirements.txt
+# ─────────────────────────────────────────────
+
+# ── Web Server (local API for Electron frontend) ──
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+
+# ── Wake Word Detection ──
+openwakeword==0.6.0
+
+# ── Speech-to-Text (GPU-accelerated via CUDA) ──
+faster-whisper==1.1.0
+nvidia-cublas-cu12==12.9.2.10    # cuBLAS DLLs needed by faster-whisper on Windows
+nvidia-cudnn-cu12==9.23.2.1      # cuDNN DLLs needed by faster-whisper on Windows
+
+# ── Claude API ──
+anthropic==0.40.0
+
+# ── Text-to-Speech (local GPU, Kokoro-82M) ──
+kokoro>=0.9.4                   # local TTS model (replaces edge-tts)
+sounddevice==0.5.1              # plays numpy audio arrays directly to speaker
+
+# ── Audio I/O ──
+pyaudio==0.2.14             # low-level mic capture (used by wake word detector)
+numpy==1.26.4               # audio buffer manipulation
+
+# ── Environment & Config ──
+python-dotenv==1.0.1        # load .env files
+tzdata==2025.2              # IANA timezone database (required by zoneinfo on Windows)
+
+# ── Async helpers ──
+anyio==4.7.0                # async utilities used by FastAPI/edge-tts
+
+# ── Logging & Dev tools ──
+loguru==0.7.2               # structured, pretty logging

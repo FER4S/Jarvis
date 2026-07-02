@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────
+#  Jarvis – Voice AI Assistant
+#  .gitignore
+# ─────────────────────────────────────────────
+
+# Secrets — never commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs
+logs/
+*.log
+
+# faster-whisper model cache
+models/whisper/
+
+# openwakeword model cache
+models/openwakeword/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
