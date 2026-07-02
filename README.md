@@ -8,7 +8,7 @@ A GPU-accelerated voice AI assistant powered by Claude.
 
 ```bash
 # 1. Clone the repo
-git clone <repository_url>
+git clone https://github.com/FER4S/Jarvis.git
 cd Jarvis
 
 # 2. Create and activate a virtual environment
