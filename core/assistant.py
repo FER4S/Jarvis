@@ -61,6 +61,14 @@ ONBOARDING_QUESTIONS: list[str] = [
 # Trigger phrases that mark an explicit "remember this" voice command.
 MEMORY_TRIGGER_PHRASES: tuple[str, ...] = ("remember that", "don't forget")
 
+# Filler tokens allowed before a trigger phrase at the start of an utterance
+# ("Please remember that…", "Jarvis, remember that…"). Any other leading word
+# ("Do you remember that…") means the boss is talking ABOUT remembering, not
+# issuing the command.
+_TRIGGER_PREFIX_TOKENS: frozenset[str] = frozenset({
+    "jarvis", "please", "hey", "ok", "okay", "oh", "and", "also", "so", "now", "um", "uh",
+})
+
 
 class AssistantState(str, Enum):
     IDLE = "idle"
@@ -318,21 +326,41 @@ class JarvisAssistant:
     @staticmethod
     def _extract_explicit_memory_trigger(text: str) -> str | None:
         """
-        Case-insensitively check whether text contains an explicit-memory
-        trigger phrase ("remember that" / "don't forget"). If so, returns the
-        substring after the trigger phrase (the fact content), stripped of
-        leading punctuation. Returns "" (not None) if the trigger phrase is
-        present but nothing meaningful follows it — still routed to the
-        confirmation path, since the boss clearly tried to invoke the command.
+        Case-insensitively check whether text STARTS with an explicit-memory
+        trigger phrase ("remember that" / "don't forget"), optionally preceded
+        by harmless filler tokens (_TRIGGER_PREFIX_TOKENS — "Jarvis,",
+        "please", "okay", …). If so, returns the substring after the trigger
+        phrase (the fact content, original casing), stripped of surrounding
+        punctuation. Returns "" (not None) if the trigger phrase is present
+        but nothing meaningful follows it — still routed to the confirmation
+        path, since the boss clearly tried to invoke the command.
 
-        Returns None if no trigger phrase is present at all, so the caller
-        proceeds to the normal get_response() path.
+        Returns None if no anchored trigger is found, so the caller proceeds
+        to the normal get_response() path. That includes utterances that
+        merely mention a trigger phrase mid-sentence: questions like "Do you
+        remember that meeting?" must reach Claude, not the memory pipeline.
+        Deliberate trade-off: a genuinely mid-sentence command ("The launch
+        is Friday — don't forget it") no longer triggers either; a false
+        negative degrades gracefully (Claude replies, and background
+        extraction can still capture it), while a false positive hijacks the
+        turn and writes garbage to memory.
         """
         lowered = text.lower()
         for trigger in MEMORY_TRIGGER_PHRASES:
             idx = lowered.find(trigger)
-            if idx != -1:
-                return text[idx + len(trigger):].strip(" ,.:;!?").strip()
+            if idx == -1:
+                continue
+            if idx > 0:
+                # Everything before the trigger must be whitelisted filler —
+                # any other word means the trigger is mid-sentence, not a
+                # command. (Also rejects partial-word hits: "misremember
+                # that…" leaves a "mis" fragment that isn't whitelisted.)
+                prefix_tokens = [
+                    token.strip(",.;:!?'\"-—…") for token in lowered[:idx].split()
+                ]
+                if not all(token in _TRIGGER_PREFIX_TOKENS for token in prefix_tokens if token):
+                    continue
+            return text[idx + len(trigger):].strip(" ,.:;!?").strip()
         return None
 
     def _speak_confirmation(self, reply: str) -> None:
