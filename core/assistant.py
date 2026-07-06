@@ -23,9 +23,16 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+import anthropic
 from loguru import logger
 
 from core.llm import LLMEngine
+from core.memory import (
+    MemoryManager,
+    STRUCTURE_KIND_FACT,
+    extract_response_text,
+    parse_json_object,
+)
 from core.stt import STTEngine
 from core.tts import TTSEngine
 from core.wake_word import WakeWordDetector
@@ -36,6 +43,23 @@ import config
 # How long (seconds) to wait for the user to START speaking on a follow-up turn
 # before giving up and ending the conversation.  First turn uses STT's default.
 FOLLOWUP_SILENCE_TIMEOUT: float = 5.0
+
+# How long (seconds) to wait for the user to answer an onboarding question —
+# longer than FOLLOWUP_SILENCE_TIMEOUT since these are substantive, open-ended
+# answers rather than quick follow-ups.
+ONBOARDING_SILENCE_TIMEOUT: float = 8.0
+
+# One-time first-run onboarding questions, asked in order.
+ONBOARDING_QUESTIONS: list[str] = [
+    "What's your name?",
+    "What's your role at CodeX?",
+    "Who are the key people you work with regularly?",
+    "What are your main priorities right now?",
+    "Is there anything else you'd like me to know about you, your work style, or your preferences?",
+]
+
+# Trigger phrases that mark an explicit "remember this" voice command.
+MEMORY_TRIGGER_PHRASES: tuple[str, ...] = ("remember that", "don't forget")
 
 
 class AssistantState(str, Enum):
@@ -75,6 +99,8 @@ class JarvisAssistant:
             speed=config.TTS_SPEED,
         )
 
+        self._memory = MemoryManager()
+
         # The wake word detector callback just signals the main thread — it must
         # not do any heavy work itself to avoid blocking the detector's internal
         # thread.
@@ -108,8 +134,8 @@ class JarvisAssistant:
 
     def run(self) -> None:
         """
-        Load all models, start the wake word detector, and block forever.
-        Handles Ctrl-C gracefully.
+        Load all models, run first-time onboarding if needed, start the wake
+        word detector, and block forever. Handles Ctrl-C gracefully.
         """
         # Load Whisper and Kokoro models once at startup
         logger.info("Loading Whisper model (first-time may download weights)…")
@@ -119,6 +145,13 @@ class JarvisAssistant:
         logger.info("Loading Kokoro TTS model…")
         self._tts.initialize()
         logger.success("Kokoro TTS ready.")
+
+        logger.info("Loading memory store…")
+        self._memory.load()
+        logger.success("Memory store ready.")
+
+        if not self._memory.is_onboarding_complete():
+            self._run_onboarding()
 
         self._running = True
         self._wake_event.clear()
@@ -152,6 +185,191 @@ class JarvisAssistant:
         finally:
             self.stop()
 
+    # ── First-run onboarding ──────────────────────────────────────────────────
+
+    def _run_onboarding(self) -> None:
+        """
+        One-time onboarding conversation, run before the wake-word loop starts.
+        Uses the assistant's already-loaded STT/TTS engines directly — no wake
+        word needed to trigger it, and the wake detector hasn't started yet at
+        this point (it loads its model / opens the mic in start(), not
+        __init__), so there's no mic contention to resolve.
+
+        A silent/empty answer to any question is recorded as blank and
+        onboarding simply moves on — it never retries or hangs, so a mic issue
+        or an away-from-desk boss can't block first-run startup forever.
+        """
+        logger.success("=" * 50)
+        logger.success("First run detected — starting onboarding.")
+        logger.success("=" * 50)
+
+        self._tts.speak(
+            "Before we get started, I'd like to get to know you better so I "
+            "can serve you well."
+        )
+
+        qa_pairs: list[tuple[str, str]] = []
+        for question in ONBOARDING_QUESTIONS:
+            self._tts.speak(question)
+            logger.info(f"[Onboarding] Asked: '{question}'")
+            answer = self._stt.listen_and_transcribe(
+                initial_silence_timeout=ONBOARDING_SILENCE_TIMEOUT
+            )
+            logger.info(f"[Onboarding] Answer: '{answer.strip() or '(no answer)'}'")
+            qa_pairs.append((question, answer.strip()))
+
+        profile = self._format_onboarding_profile(qa_pairs)
+        self._memory.complete_onboarding(profile)
+
+        self._tts.speak("Got it. I'll remember that. Let's get started.")
+        logger.success("Onboarding complete.")
+
+    @staticmethod
+    def _format_onboarding_profile(qa_pairs: list[tuple[str, str]]) -> dict:
+        """
+        One-off Claude Haiku call to format raw onboarding Q/A pairs into a
+        clean profile dict. Never raises and always returns something safe to
+        pass to MemoryManager.complete_onboarding() — falls back to
+        {"raw_qa": "<concatenated Q/A text>"} if the model doesn't return
+        valid, well-formed JSON for any reason (timeout, auth error, bad JSON,
+        wrong shape, etc.). Uses its own one-off anthropic client rather than
+        LLMEngine (which manages the stateful voice conversation) or
+        MemoryManager (whose public surface doesn't include profile
+        formatting).
+        """
+        raw_qa_text = "\n".join(
+            f"Q: {q}\nA: {a if a else '(no answer given)'}" for q, a in qa_pairs
+        )
+        fallback_profile = {"raw_qa": raw_qa_text}
+
+        try:
+            client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, timeout=10.0)
+            response = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=400,
+                system=(
+                    "Format the following onboarding question-and-answer pairs into "
+                    "a clean JSON profile object. Respond with ONLY a JSON object "
+                    "(no markdown fences, no commentary), using these keys: "
+                    "name, role, key_people, priorities, preferences — "
+                    "each a short string summarizing the corresponding answer. If "
+                    "an answer was blank/unclear, use an empty string for that key. "
+                    "Do not invent information not present in the answers."
+                ),
+                messages=[{"role": "user", "content": raw_qa_text}],
+            )
+            parsed = parse_json_object(extract_response_text(response))
+            return parsed if parsed is not None else fallback_profile
+
+        except Exception as exc:
+            logger.warning(
+                f"Onboarding profile formatting failed ({exc}) — "
+                f"falling back to raw Q/A text as the profile."
+            )
+            return fallback_profile
+
+    # ── Explicit memory commands ("remember that...") ────────────────────────
+
+    @staticmethod
+    def _extract_explicit_memory_trigger(text: str) -> str | None:
+        """
+        Case-insensitively check whether text contains an explicit-memory
+        trigger phrase ("remember that" / "don't forget"). If so, returns the
+        substring after the trigger phrase (the fact content), stripped of
+        leading punctuation. Returns "" (not None) if the trigger phrase is
+        present but nothing meaningful follows it — still routed to the
+        confirmation path, since the boss clearly tried to invoke the command.
+
+        Returns None if no trigger phrase is present at all, so the caller
+        proceeds to the normal get_response() path.
+        """
+        lowered = text.lower()
+        for trigger in MEMORY_TRIGGER_PHRASES:
+            idx = lowered.find(trigger)
+            if idx != -1:
+                return text[idx + len(trigger):].strip(" ,.:;!?").strip()
+        return None
+
+    def _speak_confirmation(self, reply: str) -> None:
+        """
+        Emit + speak a fixed confirmation line, reusing the same state/event
+        vocabulary as a normal reply turn (llm_response stands in for Claude's
+        reply; SPEAKING + speaking_started/ended around the TTS call).
+        """
+        self._emit_event("llm_response", text=reply)
+        self._set_state(AssistantState.SPEAKING)
+        self._emit_event("speaking_started")
+        self._tts.speak(reply)
+        self._emit_event("speaking_ended")
+
+    def _handle_explicit_memory(self, explicit_fact: str) -> None:
+        """
+        Handle one explicit "remember that…" command. Facts go to the facts
+        list (unchanged). Event-like commands go to the events list with dedup:
+        a new event is saved silently; one resembling an existing event triggers
+        a live spoken clarifying question ("same, rescheduled — or new?") whose
+        answer decides update-vs-add. An unclear/silent answer saves as new.
+
+        Reuses only the existing states (THINKING/LISTENING/SPEAKING) and event
+        names; adds no new ones.
+        """
+        # Empty trigger ("remember that" with nothing after it): preserve the
+        # original behavior — a plain confirmation, no structuring call.
+        if not explicit_fact.strip():
+            self._set_state(AssistantState.THINKING)
+            self._speak_confirmation("Got it, I'll remember that.")
+            return
+
+        self._set_state(AssistantState.THINKING)
+        structured = self._memory.structure_explicit_memory(explicit_fact)
+
+        # ── Fact: keep the existing fact-cleanup + facts-list path unchanged ──
+        if structured["kind"] == STRUCTURE_KIND_FACT:
+            cleaned = self._memory.clean_fact_text(explicit_fact)
+            self._memory.add_explicit_memory(cleaned)
+            self._speak_confirmation("Got it, I'll remember that.")
+            return
+
+        description = structured["description"]
+        date = structured["date"]
+        match = structured["match_description"]
+
+        # ── Event with no similar existing one: save as new, no question ──────
+        if not match:
+            self._memory.add_event(description, date)
+            self._speak_confirmation("Got it — I've noted that event.")
+            return
+
+        # ── Resembles an existing event: ask a live clarifying question ───────
+        self._speak_confirmation(
+            "I've already got a similar event noted. Is this the same one, "
+            "just rescheduled — or a new event?"
+        )
+
+        self._set_state(AssistantState.LISTENING)
+        self._emit_event("listening_started")
+        answer = self._stt.listen_and_transcribe(
+            initial_silence_timeout=FOLLOWUP_SILENCE_TIMEOUT
+        )
+        if answer.strip():
+            logger.info(f"[Explicit memory] Clarifying answer: '{answer}'")
+            self._emit_event("transcription", text=answer)
+
+        self._set_state(AssistantState.THINKING)
+        verdict = self._memory.classify_same_or_new(answer)
+
+        if verdict == "same" and self._memory.update_event_date(match, date, description):
+            self._speak_confirmation("Got it — I've updated that event.")
+        else:
+            # An explicit "new" force-appends a separate entry even if the
+            # description collides with the existing event — the boss said it's
+            # different, so the dedup net must not silently merge it. "unclear"/
+            # silent (and a stale "same" match key) add without forcing, letting
+            # dedup guard against a stray duplicate on a non-answer. Either way
+            # the information is recorded.
+            self._memory.add_event(description, date, force_new=(verdict == "new"))
+            self._speak_confirmation("Got it — I've noted that event.")
+
     # ── Wake word callback ────────────────────────────────────────────────────
 
     def _on_wake_word(self) -> None:
@@ -179,6 +397,9 @@ class JarvisAssistant:
             logger.success("=" * 50)
             logger.success("New conversation started.")
             logger.success("=" * 50)
+
+            # Compute once per conversation — memory doesn't change mid-conversation.
+            memory_context = self._memory.get_context_summary()
 
             # Greet the user once per new conversation, before any STT
             logger.info("[Greeting] Speaking opening line…")
@@ -212,13 +433,22 @@ class JarvisAssistant:
                 logger.info(f"[Transcribed] '{text}'")
                 self._emit_event("transcription", text=text)
 
-                # ── 3c. Get Claude's response ─────────────────────────────────
+                # ── 3c. Explicit memory command? ("remember that...") ─────────
+                # Replaces the normal get_response() step entirely for this turn.
+                # Never sent to self._llm.get_response(), so it never enters
+                # self._llm.history — captured directly in memory instead.
+                explicit_fact = self._extract_explicit_memory_trigger(text)
+                if explicit_fact is not None:
+                    self._handle_explicit_memory(explicit_fact)
+                    continue
+
+                # ── 3d. Get Claude's response ─────────────────────────────────
                 self._set_state(AssistantState.THINKING)
                 logger.info("[Thinking] Sending to Claude…")
-                reply = self._llm.get_response(text)
+                reply = self._llm.get_response(text, memory_context=memory_context)
                 self._emit_event("llm_response", text=reply)
 
-                # ── 3d. Speak the response ────────────────────────────────────
+                # ── 3e. Speak the response ────────────────────────────────────
                 self._set_state(AssistantState.SPEAKING)
                 self._emit_event("speaking_started")
                 logger.info(f"[Speaking] '{reply[:80]}{'…' if len(reply) > 80 else ''}'")
@@ -231,7 +461,21 @@ class JarvisAssistant:
             logger.exception(f"Unexpected error in conversation loop: {exc}")
 
         finally:
-            # ── 4. Always restart the wake detector ───────────────────────────
+            # ── 4. Extract memory in the background, then always restart the
+            #      wake detector. Spawned first, before anything else in this
+            #      block: extract_and_save() makes a Sonnet-class API call —
+            #      too slow to block "Hey Jarvis" being re-triggerable on.
+            #      self._llm.history is a defensive copy per call, and capturing
+            #      it here (before self._detector.start()) means no new
+            #      conversation's reset_history() can possibly race with it.
+            threading.Thread(
+                target=self._memory.extract_and_save,
+                args=(self._llm.history,),
+                name="jarvis-memory-extraction",
+                daemon=True,
+            ).start()
+
+            # ── 5. Always restart the wake detector ───────────────────────────
             self._set_state(AssistantState.IDLE)
             self._emit_event("idle")
             self._wake_event.clear()  # discard any stale wake events

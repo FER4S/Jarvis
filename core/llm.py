@@ -18,6 +18,7 @@ from typing import Optional
 import anthropic
 from loguru import logger
 
+from core.memory import extract_response_text
 import config
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -95,7 +96,7 @@ class LLMEngine:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def get_response(self, user_text: str) -> str:
+    def get_response(self, user_text: str, memory_context: str = "") -> str:
         """
         Send the user's transcribed speech to Claude and return its reply.
 
@@ -104,6 +105,11 @@ class LLMEngine:
 
         Args:
             user_text: Transcribed text from the STT engine.
+            memory_context: Optional short summary of what Jarvis remembers
+                about the user (from MemoryManager.get_context_summary()).
+                When provided, it's appended to the system prompt for this
+                call only — self._system_prompt itself is never mutated, so
+                omitting it behaves identically to before this parameter existed.
 
         Returns:
             Claude's plain-text reply, or a fallback string on error.
@@ -117,16 +123,24 @@ class LLMEngine:
 
         logger.info(f"Sending to Claude: '{user_text}'")
 
+        effective_system_prompt = self._system_prompt
+        if memory_context:
+            effective_system_prompt = (
+                f"{self._system_prompt}\n\n[What I remember about you] {memory_context}"
+            )
+
         try:
             response = self._client.messages.create(
                 model=self._model,
                 max_tokens=self._max_tokens,
-                system=self._system_prompt,
+                system=effective_system_prompt,
                 messages=self._history,
             )
 
-            # Extract plain text from the first content block
-            reply: str = response.content[0].text.strip()
+            # Extract plain text - response.content[0] is not reliably the text
+            # block (Claude can return e.g. a thinking block first), so scan
+            # all content blocks rather than assuming index 0.
+            reply: str = extract_response_text(response)
 
             # Append the assistant turn so follow-ups have context
             self._history.append({"role": "assistant", "content": reply})
