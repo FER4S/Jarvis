@@ -18,6 +18,7 @@ The Jarvis backend exposes a FastAPI server that the frontend can use to control
 ### 2. Status
 - **URL:** `GET /status`
 - **Description:** Returns whether the assistant pipeline is running and its current state.
+- **Note:** `running` is `true` for the entire pipeline lifetime — from the moment startup begins (model loading, first-run onboarding) until shutdown fully completes — not only while the wake-word loop is listening. A `POST /start` sent immediately after `POST /stop` may therefore return `"already running"` while the previous run winds down; poll `/status` until `running` is `false`, then retry.
 - **Example Response:**
   ```json
   {

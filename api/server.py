@@ -83,7 +83,7 @@ async def health_check() -> Dict[str, str]:
 async def get_status() -> Dict[str, Any]:
     """Returns the current assistant state."""
     return {
-        "running": getattr(assistant, "_running", False),
+        "running": assistant.is_active(),
         "state": assistant.get_state().value
     }
 
@@ -91,7 +91,7 @@ async def get_status() -> Dict[str, Any]:
 @app.post("/start", tags=["control"])
 async def start_assistant() -> Dict[str, str]:
     """Starts the assistant pipeline in a background thread."""
-    if getattr(assistant, "_running", False):
+    if assistant.is_active():
         return {"status": "already running"}
     
     logger.info("Starting Jarvis Assistant from API request...")
@@ -102,7 +102,7 @@ async def start_assistant() -> Dict[str, str]:
 @app.post("/stop", tags=["control"])
 async def stop_assistant() -> Dict[str, str]:
     """Stops the assistant cleanly."""
-    if not getattr(assistant, "_running", False):
+    if not assistant.is_active():
         return {"status": "already stopped"}
     
     logger.info("Stopping Jarvis Assistant from API request...")

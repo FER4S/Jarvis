@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import threading
+import time
 from datetime import datetime
 
 # Ensure the project root is on sys.path so `import config` works when this
@@ -28,6 +29,12 @@ import config
 # ── Storage location ─────────────────────────────────────────────────────────
 _DATA_DIR: str = os.path.join(_PROJECT_ROOT, "data")
 _MEMORY_FILE: str = os.path.join(_DATA_DIR, "memory.json")
+
+# Read attempts before declaring memory.json unreadable and quarantining it.
+# OneDrive/antivirus can hold a transient lock on the file; a short retry
+# rides that out instead of treating it as corruption.
+_LOAD_ATTEMPTS: int = 3
+_LOAD_RETRY_DELAY_S: float = 0.25
 
 # ── Models ────────────────────────────────────────────────────────────────────
 # Heavier background-task tier (memory extraction, future briefings/summaries)
@@ -179,6 +186,10 @@ class MemoryManager:
         self._client = anthropic.Anthropic(api_key=api_key)
         self._state: dict = self._empty_state()
         self._lock = threading.Lock()
+        # Set when memory.json was unreadable AND couldn't be quarantined -
+        # every save is then refused so the file on disk is never overwritten
+        # by this session's empty fallback state.
+        self._save_disabled = False
 
     @staticmethod
     def _empty_state() -> dict:
@@ -194,7 +205,14 @@ class MemoryManager:
     # ── Storage ───────────────────────────────────────────────────────────────
 
     def load(self) -> None:
-        """Load memory from disk, creating the file/directory if missing."""
+        """
+        Load memory from disk, creating the file/directory if missing.
+
+        If the file exists but cannot be read/parsed even after a short retry
+        (transient OneDrive/AV locks), it is quarantined - renamed aside for
+        manual recovery, never overwritten - and this session starts with
+        empty memory. See _quarantine_unreadable_file().
+        """
         with self._lock:
             if not os.path.isdir(_DATA_DIR):
                 os.makedirs(_DATA_DIR, exist_ok=True)
@@ -205,20 +223,69 @@ class MemoryManager:
                 self._write_locked()
                 return
 
-            try:
-                with open(_MEMORY_FILE, "r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-                merged = self._empty_state()
-                merged.update(loaded)
-                self._state = merged
-                logger.success(f"Memory loaded from {_MEMORY_FILE}.")
-            except (json.JSONDecodeError, OSError) as exc:
-                logger.error(
-                    f"Failed to load memory file ({exc}) - starting from an empty "
-                    f"in-memory state. The file on disk is left untouched until "
-                    f"the next save()."
-                )
-                self._state = self._empty_state()
+            last_exc: Exception | None = None
+            for attempt in range(1, _LOAD_ATTEMPTS + 1):
+                # ValueError covers json.JSONDecodeError (its subclass) plus the
+                # wrong-shape check below; OSError covers locked/unreadable files.
+                try:
+                    with open(_MEMORY_FILE, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    if not isinstance(loaded, dict):
+                        raise ValueError(
+                            f"top level must be a JSON object, got {type(loaded).__name__}"
+                        )
+                    merged = self._empty_state()
+                    merged.update(loaded)
+                    self._state = merged
+                    logger.success(f"Memory loaded from {_MEMORY_FILE}.")
+                    return
+                except (ValueError, OSError) as exc:
+                    last_exc = exc
+                    if attempt < _LOAD_ATTEMPTS:
+                        logger.warning(
+                            f"Failed to load memory file (attempt {attempt}/"
+                            f"{_LOAD_ATTEMPTS}: {exc}) - retrying in "
+                            f"{_LOAD_RETRY_DELAY_S}s…"
+                        )
+                        time.sleep(_LOAD_RETRY_DELAY_S)
+
+            self._quarantine_unreadable_file(last_exc)
+
+    def _quarantine_unreadable_file(self, exc: Exception | None) -> None:
+        """
+        Handle a memory.json that exists but stayed unreadable through the
+        retry loop. Caller must already hold self._lock.
+
+        The one outcome this must prevent: a later save() overwriting the
+        boss's accumulated memory with this session's empty fallback state.
+        So the bad file is renamed aside (atomic) for manual recovery; if even
+        the rename fails (file still locked), saves are disabled for the rest
+        of this session and the file on disk stays untouched.
+
+        Both failure modes mark onboarding complete in the fallback state:
+        re-running onboarding over a recoverable store would clobber (or,
+        with saves disabled, silently drop) the real profile. The genuine
+        first-run path - no file at all - never reaches here.
+        """
+        timestamp = datetime.now(config.TIMEZONE).strftime("%Y%m%d-%H%M%S")
+        quarantine_path = f"{_MEMORY_FILE}.corrupt-{timestamp}"
+        try:
+            os.replace(_MEMORY_FILE, quarantine_path)
+            logger.critical(
+                f"memory.json could not be loaded ({exc}) - moved it to "
+                f"{quarantine_path} for manual recovery. Starting with EMPTY "
+                f"memory; new saves will create a fresh file."
+            )
+        except OSError as move_exc:
+            self._save_disabled = True
+            logger.critical(
+                f"memory.json could not be loaded ({exc}) and could not be "
+                f"quarantined ({move_exc}) - memory saves are DISABLED for this "
+                f"session to protect the file on disk. Restart Jarvis once the "
+                f"file is accessible again."
+            )
+        self._state = self._empty_state()
+        self._state["onboarding_complete"] = True
 
     def save(self) -> None:
         """Write the current memory state to disk."""
@@ -227,6 +294,12 @@ class MemoryManager:
 
     def _write_locked(self) -> None:
         """Actual write logic. Caller must already hold self._lock."""
+        if self._save_disabled:
+            logger.error(
+                "Memory save skipped - saves are disabled for this session after "
+                "an unreadable memory.json was left in place (see startup log)."
+            )
+            return
         self._state["last_updated"] = datetime.now(config.TIMEZONE).isoformat()
         os.makedirs(_DATA_DIR, exist_ok=True)
         tmp_path = _MEMORY_FILE + ".tmp"

@@ -89,6 +89,10 @@ class WakeWordDetector:
 
         self._audio_queue: queue.Queue[bytes] = queue.Queue()
         self._running: threading.Event = threading.Event()
+        # Serializes stop(): two threads tearing down the same PyAudio
+        # stream/instance concurrently crashes natively (access violation in
+        # PortAudio), so the running-check + teardown must be atomic.
+        self._stop_lock: threading.Lock = threading.Lock()
         self._listener_thread: Optional[threading.Thread] = None
         self._detector_thread: Optional[threading.Thread] = None
 
@@ -137,10 +141,17 @@ class WakeWordDetector:
     def stop(self) -> None:
         """Signal both threads to stop and clean up all resources.
 
-        Safe to call even if the detector is already stopped.  Fully releases
-        the microphone and drains the audio queue so the next start() begins
-        with a clean slate.
+        Safe to call even if the detector is already stopped, and safe to call
+        from multiple threads at once (the whole teardown holds _stop_lock, so
+        a concurrent second caller waits, then sees the detector already
+        stopped and returns).  Fully releases the microphone and drains the
+        audio queue so the next start() begins with a clean slate.
         """
+        with self._stop_lock:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
+        """Actual stop logic. Caller must already hold self._stop_lock."""
         if not self._running.is_set():
             # Still drain the queue in case a previous stop left a sentinel
             self._drain_queue()

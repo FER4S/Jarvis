@@ -116,10 +116,30 @@ class JarvisAssistant:
         self._state = AssistantState.IDLE
         self._event_queue: queue.Queue[dict] = queue.Queue()
 
+        # Lifecycle guard: _active is True from run() entry to exit — covering
+        # model loading and onboarding, unlike _running which only covers the
+        # live wake loop. run() test-and-sets it under _lifecycle_lock, so two
+        # concurrent run() bodies are impossible no matter who spawns the
+        # thread (main.py auto-start, POST /start, standalone __main__).
+        self._active = False
+        self._stop_requested = False
+        self._lifecycle_lock = threading.Lock()
+        # Serializes stop()'s engine teardown — two threads tearing down
+        # PyAudio/sounddevice at once (e.g. POST /stop racing run()'s own
+        # shutdown) can crash the process natively.
+        self._shutdown_lock = threading.Lock()
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def get_state(self) -> AssistantState:
         return self._state
+
+    def is_active(self) -> bool:
+        """
+        True from run() entry to exit — includes model loading and onboarding,
+        not just the live wake loop (which is what _running tracks).
+        """
+        return self._active
 
     def get_event_queue(self) -> queue.Queue[dict]:
         return self._event_queue
@@ -136,54 +156,79 @@ class JarvisAssistant:
         """
         Load all models, run first-time onboarding if needed, start the wake
         word detector, and block forever. Handles Ctrl-C gracefully.
+
+        Idempotent across threads: if a run() is already active anywhere —
+        loading models, onboarding, or in the wake loop — a second call logs
+        a warning and returns immediately instead of starting a duplicate
+        pipeline.
         """
-        # Load Whisper and Kokoro models once at startup
-        logger.info("Loading Whisper model (first-time may download weights)…")
-        self._stt.load_model()
-        logger.success("Whisper model ready.")
-
-        logger.info("Loading Kokoro TTS model…")
-        self._tts.initialize()
-        logger.success("Kokoro TTS ready.")
-
-        logger.info("Loading memory store…")
-        self._memory.load()
-        logger.success("Memory store ready.")
-
-        if not self._memory.is_onboarding_complete():
-            self._run_onboarding()
-
-        self._running = True
-        self._wake_event.clear()
-        self._detector.start()
-
-        logger.success("─" * 50)
-        logger.success("Jarvis is ready. Say 'Hey Jarvis' to begin.")
-        logger.success("─" * 50)
+        with self._lifecycle_lock:
+            if self._active:
+                logger.warning("run() called while already active — ignoring duplicate start.")
+                return
+            self._active = True
+            self._stop_requested = False
 
         try:
-            while self._running:
-                # Block until the wake word fires
-                self._wake_event.wait()
-                self._wake_event.clear()
+            # Load Whisper and Kokoro models once at startup
+            logger.info("Loading Whisper model (first-time may download weights)…")
+            self._stt.load_model()
+            logger.success("Whisper model ready.")
 
-                if not self._running:
-                    break
+            logger.info("Loading Kokoro TTS model…")
+            self._tts.initialize()
+            logger.success("Kokoro TTS ready.")
 
-                # Run the conversation in its own thread, separate from the
-                # detector's internal callback thread, to avoid any deadlock.
-                conversation_thread = threading.Thread(
-                    target=self._run_conversation,
-                    name="jarvis-conversation",
-                    daemon=True,
-                )
-                conversation_thread.start()
-                conversation_thread.join()  # wait before listening for next wake word
+            logger.info("Loading memory store…")
+            self._memory.load()
+            logger.success("Memory store ready.")
 
-        except KeyboardInterrupt:
-            logger.info("\nCtrl-C received — shutting down Jarvis.")
+            if not self._memory.is_onboarding_complete():
+                self._run_onboarding()
+
+            # A stop() that arrived while models were loading (or during
+            # onboarding) must win — don't bring the wake loop up at all.
+            if self._stop_requested:
+                logger.info("Stop was requested during startup — not starting the wake loop.")
+                return
+
+            self._running = True
+            self._wake_event.clear()
+            self._detector.start()
+
+            logger.success("─" * 50)
+            logger.success("Jarvis is ready. Say 'Hey Jarvis' to begin.")
+            logger.success("─" * 50)
+
+            try:
+                while self._running:
+                    # Block until the wake word fires
+                    self._wake_event.wait()
+                    self._wake_event.clear()
+
+                    if not self._running:
+                        break
+
+                    # Run the conversation in its own thread, separate from the
+                    # detector's internal callback thread, to avoid any deadlock.
+                    conversation_thread = threading.Thread(
+                        target=self._run_conversation,
+                        name="jarvis-conversation",
+                        daemon=True,
+                    )
+                    conversation_thread.start()
+                    conversation_thread.join()  # wait before listening for next wake word
+
+            except KeyboardInterrupt:
+                logger.info("\nCtrl-C received — shutting down Jarvis.")
+            finally:
+                # If stop() was already requested (e.g. POST /stop), the
+                # requesting thread is running the teardown right now — don't
+                # race it with a redundant second stop() from this thread.
+                if not self._stop_requested:
+                    self.stop()
         finally:
-            self.stop()
+            self._active = False
 
     # ── First-run onboarding ──────────────────────────────────────────────────
 
@@ -487,15 +532,17 @@ class JarvisAssistant:
     # ── Shutdown ──────────────────────────────────────────────────────────────
 
     def stop(self) -> None:
-        """Gracefully stop all components."""
+        """Gracefully stop all components. Safe to call from multiple threads."""
+        self._stop_requested = True  # honored by run() if it's still starting up
         self._running = False
         self._wake_event.set()  # unblock wait() if sleeping
 
-        logger.info("Stopping wake detector…")
-        self._detector.stop()
+        with self._shutdown_lock:
+            logger.info("Stopping wake detector…")
+            self._detector.stop()
 
-        logger.info("Shutting down TTS engine…")
-        self._tts.shutdown()
+            logger.info("Shutting down TTS engine…")
+            self._tts.shutdown()
 
         logger.success("Jarvis shut down cleanly. Goodbye.")
 
