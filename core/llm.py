@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime
 
 # Ensure the project root is on sys.path so `import config` works when this
 # file is run directly (e.g. `python core/llm.py`).
@@ -108,8 +109,10 @@ class LLMEngine:
             memory_context: Optional short summary of what Jarvis remembers
                 about the user (from MemoryManager.get_context_summary()).
                 When provided, it's appended to the system prompt for this
-                call only — self._system_prompt itself is never mutated, so
-                omitting it behaves identically to before this parameter existed.
+                call only — self._system_prompt itself is never mutated.
+                The actual current date and time (config.TIMEZONE) are always
+                included in the system prompt for every call, regardless of
+                whether memory_context is given.
 
         Returns:
             Claude's plain-text reply, or a fallback string on error.
@@ -123,11 +126,13 @@ class LLMEngine:
 
         logger.info(f"Sending to Claude: '{user_text}'")
 
-        effective_system_prompt = self._system_prompt
+        now = datetime.now(config.TIMEZONE)
+        effective_system_prompt = (
+            f"{self._system_prompt}\n\n"
+            f"Right now it is {now.strftime('%A, %B %d, %Y, %I:%M %p')} ({config.TIMEZONE})."
+        )
         if memory_context:
-            effective_system_prompt = (
-                f"{self._system_prompt}\n\n[What I remember about you] {memory_context}"
-            )
+            effective_system_prompt += f"\n\n[What I remember about you] {memory_context}"
 
         try:
             response = self._client.messages.create(
