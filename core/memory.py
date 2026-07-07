@@ -183,7 +183,14 @@ class MemoryManager:
                 "ANTHROPIC_API_KEY is not set. "
                 "Memory extraction calls will fail until it is added to .env."
             )
-        self._client = anthropic.Anthropic(api_key=api_key)
+        # Realtime tier: structure_explicit_memory / clean_fact_text /
+        # classify_same_or_new run on the conversation thread with the boss
+        # actively waiting — no SDK auto-retries, fail within one timeout.
+        self._client = anthropic.Anthropic(api_key=api_key, max_retries=0)
+        # Background tier: extract_and_save runs on a daemon thread after the
+        # conversation ends — nobody is waiting, so keep the SDK's default
+        # retry behavior (retrying a transient failure there is pure upside).
+        self._background_client = anthropic.Anthropic(api_key=api_key)
         self._state: dict = self._empty_state()
         self._lock = threading.Lock()
         # Set when memory.json was unreadable AND couldn't be quarantined -
@@ -756,7 +763,7 @@ class MemoryManager:
                 "merely a similar kind of event."
             )
 
-            response = self._client.messages.create(
+            response = self._background_client.messages.create(
                 model=EXTRACTION_MODEL_ID,
                 max_tokens=EXTRACTION_MAX_TOKENS,
                 timeout=EXTRACTION_TIMEOUT,

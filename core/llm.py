@@ -86,6 +86,10 @@ class LLMEngine:
         self._client = anthropic.Anthropic(
             api_key=api_key,
             timeout=timeout,
+            # Realtime voice: the boss is waiting on every call. The SDK's
+            # default of 2 auto-retries can stack timeouts into ~30s of dead
+            # air before the fallback line — fail within one timeout instead.
+            max_retries=0,
         )
         self._model = model
         self._max_tokens = max_tokens

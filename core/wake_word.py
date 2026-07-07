@@ -41,6 +41,11 @@ SAMPLE_WIDTH: int = 2              # bytes (16-bit PCM = paInt16)
 CHUNK_SAMPLES: int = 1_280         # ~80 ms per chunk at 16 kHz (oww recommendation)
 FORMAT: int = pyaudio.paInt16
 
+# Consecutive failed mic reads tolerated before the listener gives up and
+# reports the mic as dead — a vanished device fails every read instantly, so
+# an unbounded retry loop would just burn CPU and spam logs forever.
+_MAX_CONSECUTIVE_READ_FAILURES: int = 10
+
 
 class WakeWordDetector:
     """
@@ -64,10 +69,15 @@ class WakeWordDetector:
         threshold: float = 0.5,
         device_index: Optional[int] = None,
         inference_framework: str = "onnx",
+        on_failure: Optional[Callable[[str], None]] = None,
     ) -> None:
         """
         Args:
             callback:           Function called (no arguments) on each detection.
+            on_failure:         Function called with a short reason string when
+                                the detector dies unrecoverably (mic failed to
+                                open, or too many consecutive read failures) —
+                                instead of just going silent. Optional.
             model_name:         openwakeword built-in model name.  Defaults to the
                                 value in config, falling back to "hey_jarvis".
             threshold:          Confidence score [0.0 – 1.0] above which a detection
@@ -79,6 +89,7 @@ class WakeWordDetector:
                                  or "tflite" (requires tflite-runtime).
         """
         self._callback: Callable[[], None] = callback or self._default_callback
+        self._on_failure: Optional[Callable[[str], None]] = on_failure
         self._model_name: str = getattr(config, "WAKE_WORD_MODEL", model_name)
         self._threshold: float = getattr(config, "WAKE_WORD_THRESHOLD", threshold)
         self._device_index: Optional[int] = (
@@ -209,12 +220,31 @@ class WakeWordDetector:
                 break
 
 
+    def _report_failure(self, reason: str) -> None:
+        """
+        Report an unrecoverable detector failure upward via the on_failure
+        callback (if any) so the owner can surface it, instead of the detector
+        just going silent. Callback exceptions are contained here — a broken
+        handler must not take the reporting thread down with it.
+        """
+        logger.error(f"Wake word detector failure: {reason}")
+        if self._on_failure is None:
+            return
+        try:
+            self._on_failure(reason)
+        except Exception as exc:
+            logger.error(f"on_failure callback raised an exception: {exc}")
+
     # ── Internal threads ──────────────────────────────────────────────────────
 
     def _mic_listener(self) -> None:
         """
         Opens the PyAudio input stream and continuously reads 80 ms chunks,
         pushing raw bytes onto the audio queue.
+
+        Dies loudly, not silently: a failed open or too many consecutive
+        failed reads clears _running (the detector loop exits within ~1 s via
+        its queue-timeout check) and fires the on_failure callback.
         """
         try:
             self._stream = self._pa.open(
@@ -226,19 +256,32 @@ class WakeWordDetector:
                 frames_per_buffer=CHUNK_SAMPLES,
             )
         except OSError as exc:
-            logger.error(f"Failed to open microphone: {exc}")
             self._running.clear()
+            self._report_failure(f"microphone failed to open: {exc}")
             return
 
         logger.debug(f"Microphone stream opened (device_index={self._device_index}, "
                      f"rate={SAMPLE_RATE}, chunk={CHUNK_SAMPLES})")
 
+        consecutive_failures = 0
         while self._running.is_set():
             try:
                 raw = self._stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
                 self._audio_queue.put(raw)
+                consecutive_failures = 0
             except OSError as exc:
-                logger.warning(f"Mic read error: {exc}")
+                consecutive_failures += 1
+                logger.warning(
+                    f"Mic read error "
+                    f"({consecutive_failures}/{_MAX_CONSECUTIVE_READ_FAILURES}): {exc}"
+                )
+                if consecutive_failures >= _MAX_CONSECUTIVE_READ_FAILURES:
+                    self._running.clear()
+                    self._report_failure(
+                        f"{consecutive_failures} consecutive microphone read "
+                        f"failures (last: {exc})"
+                    )
+                    return
 
     def _detector_loop(self) -> None:
         """

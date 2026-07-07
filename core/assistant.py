@@ -118,7 +118,14 @@ class JarvisAssistant:
             model_name=config.WAKE_WORD_MODEL,
             threshold=config.WAKE_WORD_THRESHOLD,
             device_index=config.MIC_DEVICE_INDEX,
+            on_failure=self._on_detector_failure,
         )
+
+        # Last unrecoverable component failure (e.g. dead mic), surfaced via
+        # GET /status and the "error" WebSocket event so the frontend can tell
+        # "process up but deaf" apart from healthy. Cleared on each detector
+        # (re)start; None = healthy.
+        self._last_error: str | None = None
 
         self._running = False
         self._state = AssistantState.IDLE
@@ -148,6 +155,13 @@ class JarvisAssistant:
         not just the live wake loop (which is what _running tracks).
         """
         return self._active
+
+    def get_last_error(self) -> str | None:
+        """
+        Last unrecoverable component failure (currently: wake word detector /
+        mic death), or None when healthy. Exposed for GET /status.
+        """
+        return self._last_error
 
     def get_event_queue(self) -> queue.Queue[dict]:
         return self._event_queue
@@ -202,7 +216,7 @@ class JarvisAssistant:
 
             self._running = True
             self._wake_event.clear()
-            self._detector.start()
+            self._start_detector()
 
             logger.success("─" * 50)
             logger.success("Jarvis is ready. Say 'Hey Jarvis' to begin.")
@@ -296,7 +310,12 @@ class JarvisAssistant:
         fallback_profile = {"raw_qa": raw_qa_text}
 
         try:
-            client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, timeout=10.0)
+            # max_retries=0: the boss is sitting through onboarding waiting on
+            # this — fail fast to the raw-Q/A fallback rather than stacking
+            # SDK auto-retries.
+            client = anthropic.Anthropic(
+                api_key=config.ANTHROPIC_API_KEY, timeout=10.0, max_retries=0
+            )
             response = client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=400,
@@ -453,6 +472,26 @@ class JarvisAssistant:
         self._emit_event("wake_word_detected")
         self._wake_event.set()
 
+    def _on_detector_failure(self, reason: str) -> None:
+        """
+        Called by WakeWordDetector (from its listener thread) when it dies
+        unrecoverably — mic failed to open, or too many consecutive read
+        failures. Records the failure for GET /status and broadcasts an
+        "error" event so the frontend can show it instead of a healthy idle.
+        """
+        self._last_error = f"wake word detector: {reason}"
+        self._emit_event("error", message=self._last_error)
+
+    def _start_detector(self) -> None:
+        """
+        Start the wake detector with a clean error slate. If the mic is still
+        dead, _on_detector_failure re-sets _last_error within milliseconds —
+        so a successful restart clears the error and a failed one keeps it
+        honest.
+        """
+        self._last_error = None
+        self._detector.start()
+
     # ── Conversation loop ─────────────────────────────────────────────────────
 
     def _run_conversation(self) -> None:
@@ -555,7 +594,7 @@ class JarvisAssistant:
             logger.success("─" * 50)
             logger.success("Ready. Say 'Hey Jarvis' to begin a new conversation.")
             logger.success("─" * 50)
-            self._detector.start()
+            self._start_detector()
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
 

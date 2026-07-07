@@ -53,6 +53,10 @@ TTS_SPEED: float = float(os.environ.get("TTS_SPEED", "1.1"))
 SERVER_HOST: str = os.environ.get("SERVER_HOST", "127.0.0.1")
 SERVER_PORT: int = int(os.environ.get("SERVER_PORT", "8000"))
 SERVER_RELOAD: bool = os.environ.get("SERVER_RELOAD", "false").lower() == "true"
+# Shared secret the frontend must present to use /start, /stop and /events.
+# Empty = auth fails closed (all protected requests rejected). Generate one:
+#   python -c "import secrets; print(secrets.token_urlsafe(32))"
+JARVIS_API_TOKEN: str = os.environ.get("JARVIS_API_TOKEN", "")
 
 # ── Logging ───────────────────────────────────
 # Loguru level: TRACE | DEBUG | INFO | SUCCESS | WARNING | ERROR | CRITICAL
