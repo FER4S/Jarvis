@@ -35,3 +35,10 @@ anyio==4.7.0                # async utilities used by FastAPI/edge-tts
 
 # ── Logging & Dev tools ──
 loguru==0.7.2               # structured, pretty logging
+
+# ── Email integration ──
+imapclient==3.0.1                 # IMAP with parsed responses & sane UID/flag handling (raw imaplib returns raw byte-tuple soup)
+google-api-python-client==2.154.0 # Gmail API client
+google-auth==2.36.0                # Google OAuth2 credentials / token refresh
+google-auth-oauthlib==1.2.1        # OAuth consent flow (Flow.from_client_config)
+google-auth-httplib2==0.2.0        # httplib2 transport bridge required by the API client

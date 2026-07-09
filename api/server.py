@@ -4,6 +4,7 @@
 # ─────────────────────────────────────────────
 
 import asyncio
+import html
 import secrets
 import threading
 from typing import Dict, Any, Optional, Set
@@ -11,13 +12,24 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from imapclient.exceptions import IMAPClientError
 from loguru import logger
+from pydantic import BaseModel, Field
 
 from core.assistant import JarvisAssistant
+from core.email_manager import OAUTH_STATE_TTL_S
 import config
 
 # Global singleton assistant
 assistant = JarvisAssistant()
+# Exactly one EmailManager must exist per process - bind to the assistant's
+# shared instance rather than constructing a second one (two instances would
+# double-poll and race the cache file; see core/email_manager.py's module
+# docstring).
+email_manager = assistant.get_email_manager()
 
 # ── API token auth ────────────────────────────────────────────────────────────
 # /start, /stop and /events carry control of the assistant and the live
@@ -28,8 +40,10 @@ assistant = JarvisAssistant()
 
 if not config.JARVIS_API_TOKEN:
     logger.warning(
-        "JARVIS_API_TOKEN is not set — /start, /stop and /events will reject "
-        "all requests until it is added to .env (see .env.example)."
+        "JARVIS_API_TOKEN is not set — /start, /stop, /events, and all "
+        "/email/* endpoints (except the OAuth callback, which is protected "
+        "by a one-time state nonce instead) will reject all requests until "
+        "it is added to .env (see .env.example)."
     )
 
 
@@ -82,10 +96,18 @@ async def broadcast_events():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Start the background broadcaster task
+    # Startup: load the email account store/cache, start its poller (both
+    # calls are idempotent - assistant.run(), if also active, may have
+    # already done this; see core/email_manager.py's module docstring), then
+    # start the background event broadcaster task.
+    await asyncio.to_thread(email_manager.initialize)
+    email_manager.start_polling()
     task = asyncio.create_task(broadcast_events())
     yield
-    # Shutdown: Cancel the broadcaster task
+    # Shutdown: stop the email poller (assistant.stop() deliberately does
+    # NOT do this - see EmailManager.stop_polling()'s docstring) and cancel
+    # the broadcaster task.
+    email_manager.stop_polling()
     task.cancel()
 
 
@@ -172,3 +194,184 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info("WebSocket client disconnected.")
     finally:
         active_websockets.discard(websocket)
+
+
+# ── Email ──────────────────────────────────────────────────────────────────
+# All endpoints below require the same JARVIS_API_TOKEN as /start and /stop,
+# EXCEPT the OAuth callback: Google's redirect is a plain browser GET that
+# cannot carry an Authorization header. That one is instead protected by a
+# one-time state nonce minted by /oauth-url (which IS behind require_token),
+# so with JARVIS_API_TOKEN unset, no nonce can ever be minted and the whole
+# OAuth chain still fails closed. Every blocking call (IMAP validation,
+# OAuth token exchange, account deletion) runs via asyncio.to_thread so it
+# never stalls the WebSocket event broadcaster.
+
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    # Requested now (unused until a future sending feature ships) so
+    # connected accounts won't need re-consent later.
+    "https://www.googleapis.com/auth/gmail.send",
+]
+
+_OAUTH_RESULT_HTML = """<!doctype html>
+<html><head><title>Jarvis - Gmail</title></head>
+<body style="font-family: sans-serif; text-align: center; padding-top: 4rem;">
+<h2>{message}</h2>
+</body></html>"""
+
+
+class ImapAccountRequest(BaseModel):
+    label: str = Field(min_length=1, max_length=60)
+    host: str = Field(min_length=1)
+    port: int = Field(default=993, ge=1, le=65535)
+    username: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+    use_ssl: bool = True
+
+
+def _sanitize_imap_error(exc: Exception) -> str:
+    """
+    Maps a test_connection() failure to a user-safe message - never echoes
+    the raw exception text (which can include IMAP server banners) back in
+    an API response or a log line.
+    """
+    if isinstance(exc, IMAPClientError):
+        return "Login failed — check the username and password."
+    if isinstance(exc, OSError):  # socket timeouts, DNS failures, TLS errors, refused connections
+        return "Could not connect to the server — check the host, port, and SSL setting."
+    return "Could not connect with the given IMAP settings."
+
+
+def _gmail_redirect_uri() -> str:
+    return f"{config.GOOGLE_OAUTH_REDIRECT_BASE}/email/accounts/gmail/oauth-callback"
+
+
+def _build_oauth_flow() -> Flow:
+    redirect_uri = _gmail_redirect_uri()
+    client_config = {
+        "web": {
+            "client_id": config.GOOGLE_OAUTH_CLIENT_ID,
+            "client_secret": config.GOOGLE_OAUTH_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [redirect_uri],
+        }
+    }
+    flow = Flow.from_client_config(client_config, scopes=GMAIL_SCOPES)
+    flow.redirect_uri = redirect_uri
+    return flow
+
+
+@app.post("/email/accounts/imap", tags=["email"], dependencies=[Depends(require_token)])
+async def add_imap_account(request: ImapAccountRequest) -> Dict[str, Any]:
+    """Adds a Hostinger-style (or any standard) IMAP account. Validates the
+    connection live before storing - never persists unreachable credentials."""
+    try:
+        account = await asyncio.to_thread(
+            email_manager.add_imap_account,
+            request.label, request.host, request.port,
+            request.username, request.password, request.use_ssl,
+        )
+    except Exception as exc:
+        logger.warning(f"IMAP account validation failed for host '{request.host}': {type(exc).__name__}")
+        raise HTTPException(status_code=400, detail=_sanitize_imap_error(exc))
+    return {"account": account}
+
+
+@app.get("/email/accounts/gmail/oauth-url", tags=["email"], dependencies=[Depends(require_token)])
+async def gmail_oauth_url() -> Dict[str, Any]:
+    """
+    Returns the Google consent URL to open in a browser. Minting the state
+    nonce here - behind require_token - is what lets the callback (which
+    can't carry a bearer header) effectively inherit this endpoint's auth.
+    """
+    if not config.GOOGLE_OAUTH_CLIENT_ID or not config.GOOGLE_OAUTH_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="Gmail OAuth is not configured — set GOOGLE_OAUTH_CLIENT_ID/"
+            "GOOGLE_OAUTH_CLIENT_SECRET in .env.",
+        )
+    flow = _build_oauth_flow()
+    state = email_manager.mint_oauth_state()
+    # prompt=consent is load-bearing: Google omits refresh_token on repeat
+    # consents without it, and a refresh token is the whole point.
+    auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent", state=state)
+    return {"url": auth_url, "expires_in": int(OAUTH_STATE_TTL_S)}
+
+
+@app.get("/email/accounts/gmail/oauth-callback", tags=["email"])
+async def gmail_oauth_callback(state: str = "", code: str = "", error: str = "") -> HTMLResponse:
+    """
+    Handles Google's OAuth redirect. Deliberately NOT behind require_token -
+    see the "Email" section header comment above for why the state nonce
+    takes its place. Never logs or renders the authorization code or any
+    token; the only values ever interpolated into the response HTML are our
+    own fixed strings (plus the boss's own, HTML-escaped, Gmail address).
+    """
+    if not email_manager.consume_oauth_state(state):
+        return HTMLResponse(
+            _OAUTH_RESULT_HTML.format(
+                message="This link is invalid or has expired. Please try connecting your Gmail account again."
+            ),
+            status_code=403,
+        )
+
+    if error:
+        logger.info("Gmail OAuth: consent was cancelled or denied.")
+        return HTMLResponse(
+            _OAUTH_RESULT_HTML.format(
+                message="Connection cancelled — you can try again anytime from the settings dashboard."
+            )
+        )
+
+    if not code:
+        return HTMLResponse(
+            _OAUTH_RESULT_HTML.format(message="No authorization code was received. Please try again."),
+            status_code=400,
+        )
+
+    def _exchange_and_store() -> str:
+        flow = _build_oauth_flow()
+        flow.fetch_token(code=code)
+        credentials = flow.credentials
+        if not credentials.refresh_token:
+            return (
+                "Google didn't grant a long-lived connection this time. Please remove "
+                "Jarvis's access at myaccount.google.com/permissions and try connecting again."
+            )
+        service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+        profile = service.users().getProfile(userId="me").execute()
+        email_address = profile.get("emailAddress", "")
+        email_manager.add_gmail_account(email_address or "Gmail", credentials.refresh_token, email_address)
+        return f"Gmail account connected — {html.escape(email_address)}. You can close this tab."
+
+    try:
+        message = await asyncio.to_thread(_exchange_and_store)
+    except Exception as exc:
+        logger.warning(f"Gmail OAuth exchange failed: {type(exc).__name__}")
+        return HTMLResponse(
+            _OAUTH_RESULT_HTML.format(message="Something went wrong connecting your Gmail account. Please try again."),
+            status_code=400,
+        )
+
+    return HTMLResponse(_OAUTH_RESULT_HTML.format(message=message))
+
+
+@app.get("/email/accounts", tags=["email"], dependencies=[Depends(require_token)])
+async def list_email_accounts() -> Dict[str, Any]:
+    """Lists connected accounts - label and provider only, never credentials."""
+    return {"accounts": email_manager.list_accounts_safe()}
+
+
+@app.delete("/email/accounts/{account_id}", tags=["email"], dependencies=[Depends(require_token)])
+async def delete_email_account(account_id: str) -> Dict[str, str]:
+    removed = await asyncio.to_thread(email_manager.delete_account, account_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="No email account with that id.")
+    return {"status": "deleted"}
+
+
+@app.get("/email/summary", tags=["email"], dependencies=[Depends(require_token)])
+async def email_summary() -> Dict[str, Any]:
+    """Dashboard payload: unread counts + recent subjects/senders per account."""
+    return email_manager.get_summary()

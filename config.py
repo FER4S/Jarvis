@@ -62,3 +62,15 @@ JARVIS_API_TOKEN: str = os.environ.get("JARVIS_API_TOKEN", "")
 # Loguru level: TRACE | DEBUG | INFO | SUCCESS | WARNING | ERROR | CRITICAL
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO")
 LOG_FILE: str | None = os.environ.get("LOG_FILE")  # e.g. "logs/jarvis.log"
+
+# ── Email ─────────────────────────────────────
+# Google Cloud OAuth "Web application" client (Gmail API enabled), used for
+# connecting Gmail accounts. Redirect URI registered on that client must be
+# exactly "<GOOGLE_OAUTH_REDIRECT_BASE>/email/accounts/gmail/oauth-callback".
+GOOGLE_OAUTH_CLIENT_ID: str = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+GOOGLE_OAUTH_CLIENT_SECRET: str = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
+GOOGLE_OAUTH_REDIRECT_BASE: str = os.environ.get(
+    "GOOGLE_OAUTH_REDIRECT_BASE", "http://localhost:8000"
+)
+# How often (seconds) to poll all connected email accounts for new mail.
+EMAIL_POLL_INTERVAL_S: int = int(os.environ.get("EMAIL_POLL_INTERVAL_S", "240"))
