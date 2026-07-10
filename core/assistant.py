@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import os
+import re
+import smtplib
 import sys
 import threading
 import queue
@@ -27,12 +29,19 @@ import anthropic
 from loguru import logger
 
 from core.email_fetch import sanitize_body_text
-from core.email_manager import EmailManager, VAGUE_TIMEFRAME_DAYS_BACK_DEFAULT
+from core.email_manager import (
+    CONFIRM_NO,
+    CONFIRM_REVISE,
+    CONFIRM_YES,
+    EmailManager,
+    VAGUE_TIMEFRAME_DAYS_BACK_DEFAULT,
+)
 from core.llm import LLMEngine
 from core.memory import (
     MemoryManager,
     STRUCTURE_KIND_FACT,
     extract_response_text,
+    is_valid_email,
     parse_json_object,
 )
 from core.stt import STTEngine
@@ -50,6 +59,19 @@ FOLLOWUP_SILENCE_TIMEOUT: float = 5.0
 # longer than FOLLOWUP_SILENCE_TIMEOUT since these are substantive, open-ended
 # answers rather than quick follow-ups.
 ONBOARDING_SILENCE_TIMEOUT: float = 8.0
+
+# How long (seconds) to wait for an answer to "should I send it?". The longest
+# window in the codebase on purpose: the boss has just heard a whole drafted
+# email read aloud and needs time to actually think it over, not react. A short
+# window here would turn "still deciding" into silence — which cancels the send
+# and makes him start again. (This bounds waiting for speech to START; once he
+# begins talking, core/stt.py's trailing-silence rules take over as usual.)
+SEND_CONFIRM_SILENCE_TIMEOUT: float = 15.0
+
+# Same generosity for dictating or typing an email address: reading one back
+# letter by letter takes a moment, and the boss may be switching to the
+# dashboard to type it instead of saying it.
+ADDRESS_ENTRY_SILENCE_TIMEOUT: float = 15.0
 
 # One-time first-run onboarding questions, asked in order.
 ONBOARDING_QUESTIONS: list[str] = [
@@ -73,15 +95,66 @@ _TRIGGER_PREFIX_TOKENS: frozenset[str] = frozenset({
 
 # Keywords that gate a normal (non-announcement) turn into email-intent
 # classification, so an unrelated "read me a poem" doesn't cost a Haiku call.
+# The send verbs are here because "send Michael a note" carries no other email
+# word. This gate is a cost optimization, not semantics: a false positive
+# ("send me the weather") costs one fast Haiku call and resolves to not_email.
 EMAIL_KEYWORDS: frozenset[str] = frozenset({
     "email", "emails", "e-mail", "mail", "inbox", "unread",
     "gmail", "hostinger", "message", "messages", "read",
+    "send", "reply", "compose", "forward", "draft",
 })
 
 # How many unresolved clarify-and-re-search rounds a "find this email"
 # request gets before Jarvis offers to just show everything matching what's
 # known so far, instead of asking indefinitely.
 MAX_SEARCH_REFINEMENT_ROUNDS: int = 3
+
+# ── Send-flow bounds ─────────────────────────────────────────────────────────
+# Every loop in the send sub-dialogue is bounded, and every bound exits toward
+# NOT sending. A send cannot be undone, so the failure mode of "asked one time
+# too few" is a re-ask; the failure mode of "guessed" is an email the boss
+# never approved.
+
+# Attempts to capture a recipient's address (spoken or typed) before giving up.
+MAX_ADDRESS_ROUNDS: int = 3
+# "Make it shorter" / "change the time to six" rounds before Jarvis stops
+# rewriting and lets the boss start over.
+MAX_SEND_REVISION_ROUNDS: int = 3
+# How many times a garbled/ambiguous answer to "should I send it?" is re-asked
+# before the send is cancelled outright. Two: one blunt "yes or no" retry, then
+# stop. Never guess in favor of sending.
+MAX_SEND_CONFIRM_ROUNDS: int = 2
+
+# Spoken renderings for the characters that appear in an email address, used to
+# read one back for confirmation. Derived in Python from the VALIDATED address
+# rather than asked of a model — reading back the model's own idea of what it
+# heard would confirm nothing.
+_ADDRESS_SYMBOL_WORDS: dict[str, str] = {
+    ".": "dot", "_": "underscore", "-": "dash", "+": "plus",
+}
+
+
+def _clean(value) -> str:
+    """Coerce a possibly-None/non-string value into a stripped string. The
+    classifier and the normalized email dict both use JSON null for "absent",
+    so a bare .strip() on a .get() would raise."""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+# Intents that browse/read/reason over a specific account's mail — these
+# participate in "account focus" (a follow-up like "load earlier" stays on
+# the account the boss was just discussing). check_new/check_now are
+# deliberately excluded: "how many unread" is an all-accounts question.
+_ACCOUNT_FOCUS_INTENTS: frozenset[str] = frozenset({
+    "list_emails", "from_person", "read_email", "load_more",
+    "summarize", "action_needed", "meetings_mentioned",
+})
+# Matches an utterance that explicitly wants ALL/BOTH accounts, which clears
+# any single-account focus (e.g. "check both accounts", "all my inboxes").
+_ALL_ACCOUNTS_RE = re.compile(
+    r"\b(all|both|every|each|either)\b.{0,15}\b(account|accounts|email|emails|inbox|inboxes|mail)\b"
+)
 
 
 class AssistantState(str, Enum):
@@ -454,17 +527,24 @@ class JarvisAssistant:
         self._tts.speak(reply)
         self._emit_event("speaking_ended")
 
-    def _ask_and_listen(self, question: str) -> str:
+    def _ask_and_listen(
+        self, question: str, *, silence_timeout: float = FOLLOWUP_SILENCE_TIMEOUT
+    ) -> str:
         """
-        Speak a clarifying question, then listen for the answer using the
-        follow-up timeout. Returns the transcribed answer ("" if silent).
-        Shared by the explicit-memory clarify dialogue and the email-query
-        clarify dialogues - same speak/listen/emit pattern either way.
+        Speak a clarifying question, then listen for the answer. Returns the
+        transcribed answer ("" if silent). Shared by the explicit-memory
+        clarify dialogue and the email-query clarify dialogues - same
+        speak/listen/emit pattern either way.
+
+        `silence_timeout` bounds how long to wait for the boss to START
+        speaking. It defaults to the ordinary follow-up window; the send flow
+        passes a much longer one, because deciding whether to send a drafted
+        email is thinking, not reacting.
         """
         self._speak_confirmation(question)
         self._set_state(AssistantState.LISTENING)
         self._emit_event("listening_started")
-        answer = self._stt.listen_and_transcribe(initial_silence_timeout=FOLLOWUP_SILENCE_TIMEOUT)
+        answer = self._stt.listen_and_transcribe(initial_silence_timeout=silence_timeout)
         if answer.strip():
             logger.info(f"[Clarifying answer] '{answer}'")
             self._emit_event("transcription", text=answer)
@@ -578,8 +658,8 @@ class JarvisAssistant:
             # alive and resumes on the next email turn (resumable, no-trap).
             return False
 
-        # dismiss and send_email bypass the accounts check - their replies
-        # are true whether or not any accounts are connected.
+        # dismiss bypasses the accounts check below - its reply is true
+        # whether or not any accounts are connected.
         if intent == "dismiss":
             self._handle_email_dismiss(email_ctx)
             return True
@@ -596,12 +676,32 @@ class JarvisAssistant:
         if not is_search:
             email_ctx["pending_search"] = None
 
-        if intent != "send_email" and not self._email.has_accounts():
+        if not self._email.has_accounts():
             self._speak_confirmation(
                 "You don't have any email accounts connected yet — you can "
                 "add one from the settings dashboard."
             )
             return True
+
+        # ── Account focus ─────────────────────────────────────────────────
+        # Keep the boss scoped to the account they're browsing across turns:
+        # naming an account sets the focus; a follow-up with no account
+        # inherits it (so "load earlier" stays on Gmail); an explicit "all/
+        # both accounts" clears it. Mutating parsed["account_hint"] means the
+        # downstream handlers apply it with no further changes.
+        if intent in _ACCOUNT_FOCUS_INTENTS:
+            previous_focus = email_ctx.get("account_focus")
+            if _ALL_ACCOUNTS_RE.search(lowered):
+                email_ctx["account_focus"] = None
+            elif parsed["account_hint"]:
+                email_ctx["account_focus"] = parsed["account_hint"]
+            elif previous_focus:
+                parsed["account_hint"] = previous_focus
+            # Changing which inbox we're looking at invalidates the paging
+            # anchor — "earlier than that" only means something within the
+            # batch the boss was just shown from THIS account.
+            if email_ctx.get("account_focus") != previous_focus:
+                email_ctx["oldest_shown"] = None
 
         if intent in ("check_new", "check_now"):
             self._handle_email_counts(parsed, email_ctx, live=(intent == "check_now"))
@@ -611,12 +711,14 @@ class JarvisAssistant:
             self._handle_read_email(parsed, email_ctx)
         elif is_search:  # list_emails/from_person WITH a topic → find-a-specific-email
             self._handle_email_search(parsed, email_ctx, auto_read=False)
+        elif intent == "load_more":
+            self._handle_load_more(parsed, email_ctx)
         elif intent in ("list_emails", "from_person"):  # pure browse, no topic
             self._handle_email_list(parsed, email_ctx)
         elif intent in ("summarize", "action_needed", "meetings_mentioned"):
             self._handle_email_reasoning(parsed, intent)
         elif intent == "send_email":
-            self._handle_send_decline()
+            self._handle_send_email(email_ctx, text)
         else:
             return False  # unreachable given classify_intent's whitelist, but never hijack
 
@@ -643,6 +745,9 @@ class JarvisAssistant:
         total = overview["total"]
         broken_accounts = [a["label"] for a in overview["per_account"] if a["last_error"]]
 
+        per_account = overview["per_account"]
+        accounts_with_unread = [a for a in per_account if a["unread_count"] > 0]
+
         if total == 0:
             reply = "No new emails right now."
         elif total == 1 and overview["latest"] is not None:
@@ -651,6 +756,13 @@ class JarvisAssistant:
             # This email was just SPOKEN — make it the referent so a
             # follow-up "read it" resolves without a clarify round.
             email_ctx["last_listed"] = [e]
+        elif len(per_account) > 1 and len(accounts_with_unread) >= 1:
+            # More than one account connected — name the per-account split so
+            # it's clear these are distinct inboxes, not one blob.
+            breakdown = ", ".join(
+                f"{a['unread_count']} in {a['label']}" for a in per_account
+            )
+            reply = f"You've got {total} unread emails — {breakdown}."
         else:
             reply = f"You've got {total} unread emails across your connected accounts."
 
@@ -698,6 +810,33 @@ class JarvisAssistant:
 
         self._speak_email_batch(emails, email_ctx)
 
+    def _handle_load_more(self, parsed: dict, email_ctx: dict) -> None:
+        """
+        "Load earlier emails" / "show me older ones" — page back past the batch
+        just read out, rather than re-running the same query and repeating it.
+        Anchored on email_ctx["oldest_shown"] (set by _speak_email_batch) and
+        scoped to the account in focus. Always a live provider search, since
+        the poll cache only holds the recent window.
+        """
+        anchor = email_ctx.get("oldest_shown")
+        if not anchor:
+            # Nothing has been listed yet — "show me more" is just a first list.
+            self._handle_email_list(parsed, email_ctx)
+            return
+
+        self._speak_confirmation("Hold on — let me look further back.")
+        self._set_state(AssistantState.THINKING)
+        emails = self._email.get_older_emails(
+            account_hint=parsed["account_hint"],
+            before_date=anchor,
+            sender=parsed["sender"],
+            limit=parsed["count"] or 5,
+        )
+        if not emails:
+            self._speak_confirmation("I couldn't find any emails older than those.")
+            return
+        self._speak_email_batch(emails, email_ctx)
+
     def _speak_email_batch(self, emails: list[dict], email_ctx: dict) -> None:
         """
         Speaks a non-empty batch of emails using the shared "you've got N:
@@ -707,8 +846,14 @@ class JarvisAssistant:
         resolves against what the boss actually heard. Caller handles the
         empty-result case itself (the right "nothing found" wording differs
         by caller).
+
+        Also records the OLDEST email actually spoken as the paging anchor, so
+        a follow-up "load earlier emails" fetches mail older than what the boss
+        just heard instead of re-reading the same batch.
         """
-        email_ctx["last_listed"] = emails[:5]
+        spoken = emails[:5]
+        email_ctx["last_listed"] = spoken
+        email_ctx["oldest_shown"] = min(e["date"] for e in spoken)
         if len(emails) == 1:
             e = emails[0]
             reply = f"You've got one: from {e['sender_name']}, about \"{e['subject']}\"."
@@ -1169,12 +1314,390 @@ class JarvisAssistant:
         answer_text = self._email.reason_over_emails(question, emails)
         self._speak_confirmation(answer_text)
 
-    def _handle_send_decline(self) -> None:
-        self._set_state(AssistantState.THINKING)
-        self._speak_confirmation(
-            "I can't send emails yet — that's coming soon. I can read or "
-            "summarize them for you in the meantime."
+    # ── Sending email ─────────────────────────────────────────────────────────
+    #
+    # The whole send flow is ONE self-contained sub-dialogue: _handle_send_email
+    # drives its own speak/listen rounds and returns only once the email is
+    # sent, cancelled, or abandoned. It never hands control back to the turn
+    # loop mid-send, which buys two structural guarantees the reading build had
+    # to learn the hard way:
+    #
+    #   1. The confirmation answer never passes back through classify_intent,
+    #      so "send it" can never be re-routed to read_email by a classifier
+    #      that confused two similar-sounding intents.
+    #   2. There is no cross-turn pending_send state, so none can be lost
+    #      between turns or leak into a later, unrelated conversation.
+    #
+    # The only cross-thread state is the pending contact request (the dashboard
+    # may fulfil it), and that is closed in a finally here AND in
+    # _run_conversation's.
+
+    @staticmethod
+    def _spell_email_for_speech(address: str) -> str:
+        """
+        Render an address for a spoken readback: "feras@codex.com" becomes
+        "f-e-r-a-s at codex dot com". The local part is spelled out letter by
+        letter (that's where STT actually goes wrong), while the domain is
+        spoken as words, which is how people verify one.
+
+        Built in Python from the ALREADY-VALIDATED address that will really be
+        used - never from the model's transcription of what it thought it
+        heard, which would confirm nothing.
+        """
+        local, _, domain = address.partition("@")
+
+        def spell(text: str) -> str:
+            return "-".join(_ADDRESS_SYMBOL_WORDS.get(ch, ch) for ch in text)
+
+        domain_words = " dot ".join(
+            part for part in domain.split(".") if part
         )
+        return f"{spell(local)} at {domain_words}"
+
+    def _capture_email_address(self, person_name: str) -> str | None:
+        """
+        Get an address for `person_name`, by voice or from the dashboard.
+        Returns a validated address, or None if the boss never supplied one
+        (in which case the caller sends nothing).
+
+        Voice is the default path: the boss says it, Jarvis spells it back, and
+        only an explicit "yes" accepts it. Typing is the optional alternative
+        for when he'd rather not trust STT with symbols and spelling - a typed
+        address is exact, so it needs no readback (it is still read back as
+        part of the whole draft before anything sends).
+        """
+        self._email.open_contact_request(person_name)
+        self._emit_event("contact_email_requested", name=person_name)
+        try:
+            question = (
+                f"I don't have an email address for {person_name}. "
+                "You can say it, or type it into the dashboard."
+            )
+            for _ in range(MAX_ADDRESS_ROUNDS):
+                # Check the dashboard FIRST: the boss may have typed it while
+                # Jarvis was still speaking the question.
+                typed = self._email.claim_contact_email()
+                if typed:
+                    logger.info(f"[Send] Address for '{person_name}' arrived from the dashboard.")
+                    self._emit_event("contact_email_resolved", source="typed")
+                    return typed
+
+                answer = self._ask_and_listen(
+                    question, silence_timeout=ADDRESS_ENTRY_SILENCE_TIMEOUT
+                )
+                question = "Sorry — what's the address? You can also type it in the dashboard."
+
+                if not answer.strip():
+                    # Silence usually means he's typing, not that he left.
+                    typed = self._email.claim_contact_email()
+                    if typed:
+                        logger.info(f"[Send] Address for '{person_name}' arrived from the dashboard.")
+                        self._emit_event("contact_email_resolved", source="typed")
+                        return typed
+                    continue
+
+                self._set_state(AssistantState.THINKING)
+                spoken = self._email.parse_spoken_email_address(answer)
+                if not spoken:
+                    continue
+
+                readback = self._ask_and_listen(
+                    f"I heard {self._spell_email_for_speech(spoken)}. Is that right?",
+                    silence_timeout=ADDRESS_ENTRY_SILENCE_TIMEOUT,
+                )
+                self._set_state(AssistantState.THINKING)
+                if self._email.classify_confirmation(readback) == CONFIRM_YES:
+                    self._emit_event("contact_email_resolved", source="voice")
+                    return spoken
+                # Anything short of a clear yes means try again, not "close enough".
+
+            self._emit_event("contact_email_resolved", source="cancelled")
+            self._speak_confirmation(
+                f"I still don't have an address for {person_name}, so I haven't sent anything."
+            )
+            return None
+        finally:
+            self._email.close_contact_request()
+
+    def _resolve_recipient(self, parsed: dict, email_ctx: dict) -> tuple[str, str] | None:
+        """
+        Work out who the email goes to. Returns (display_name, address), or
+        None having already spoken the reason it couldn't.
+
+        A reply resolves against email_ctx["last_read"] - the same referent
+        "who sent it?" already uses, set by _read_email_aloud and
+        _handle_email_question. That is deliberately the ONLY reply-resolution
+        mechanism: no parallel tracking of "the email being discussed".
+        """
+        last_read = email_ctx.get("last_read")
+
+        if parsed["is_reply"]:
+            if not last_read:
+                self._speak_confirmation(
+                    "I'm not sure which email you'd like me to reply to — "
+                    "read one first, then ask me to reply."
+                )
+                return None
+            address = _clean(last_read.get("sender_email"))
+            if not is_valid_email(address):
+                self._speak_confirmation(
+                    "That email doesn't have a usable reply address, so I can't answer it."
+                )
+                return None
+            return sanitize_body_text(_clean(last_read.get("sender_name"))) or address, address
+
+        recipient = _clean(parsed["recipient"])
+        if not recipient:
+            recipient = self._ask_and_listen("Who should I send it to?").strip()
+            if not recipient:
+                self._speak_confirmation("No problem — I haven't sent anything.")
+                return None
+
+        # The boss spelled out a literal address rather than naming a person.
+        if is_valid_email(recipient):
+            return recipient, recipient
+
+        matches = self._memory.find_people_by_name(recipient)
+        if len(matches) > 1:
+            person = self._disambiguate_person(matches)
+            if person is None:
+                return None
+        elif matches:
+            person = matches[0]
+        else:
+            person = None
+
+        name = _clean(person.get("name")) if person else recipient
+        stored = _clean(person.get("email")) if person else ""
+        if is_valid_email(stored):
+            return name, stored
+
+        address = self._capture_email_address(name)
+        if not address:
+            return None
+        # Remember it, so the next email to this person needs no spelling.
+        self._memory.set_person_email(name, address)
+        return name, address
+
+    def _disambiguate_person(self, matches: list[dict]) -> dict | None:
+        """Several stored people match the spoken name. Ask which, and resolve
+        the answer by name. Returns None having spoken the outcome itself."""
+        names = [_clean(p.get("name")) for p in matches]
+        options = ", ".join(names[:-1]) + f", or {names[-1]}"
+        answer = self._ask_and_listen(f"I know a few — {options}. Which one?")
+        self._set_state(AssistantState.THINKING)
+
+        if not answer.strip():
+            self._speak_confirmation("No problem — I haven't sent anything.")
+            return None
+
+        lowered = answer.lower()
+        # Longest name first, so "Michael Heckin" beats a bare "Michael" when
+        # the boss said the full name.
+        for person in sorted(matches, key=lambda p: -len(_clean(p.get("name")))):
+            if _clean(person.get("name")).lower() in lowered:
+                return person
+
+        self._speak_confirmation("Sorry, I couldn't tell which one you meant — I haven't sent anything.")
+        return None
+
+    def _resolve_send_account(self, account_hint: str | None) -> dict | None:
+        """
+        Which account to send FROM. One connected account is used silently; a
+        hint that identifies exactly one is honored; otherwise Jarvis asks.
+
+        send_email is deliberately absent from _ACCOUNT_FOCUS_INTENTS: the
+        inbox the boss happened to be browsing must not silently decide the
+        identity he sends as.
+        """
+        accounts = self._email.resolve_accounts_by_hint(account_hint)
+        if len(accounts) == 1:
+            return accounts[0]
+
+        if not accounts:
+            # A hint that matched nothing - fall back to the full list.
+            accounts = self._email.list_accounts_safe()
+            if len(accounts) == 1:
+                return accounts[0]
+            if not accounts:
+                self._speak_confirmation("You don't have any email accounts connected yet.")
+                return None
+
+        labels = [a["label"] for a in accounts]
+        options = ", ".join(labels[:-1]) + f", or {labels[-1]}"
+        answer = self._ask_and_listen(f"Which account should I send from — {options}?")
+        self._set_state(AssistantState.THINKING)
+
+        if answer.strip():
+            narrowed = self._email.resolve_accounts_by_hint(answer.strip())
+            if len(narrowed) == 1:
+                return narrowed[0]
+            for account in accounts:
+                if account["label"].lower() in answer.lower():
+                    return account
+
+        self._speak_confirmation("I wasn't sure which account you meant, so I haven't sent anything.")
+        return None
+
+    def _speak_draft(self, name: str, address: str, draft: dict) -> None:
+        """
+        Read a drafted email back for approval. Sanitizes every spoken part.
+
+        Deliberately NOT routed through _read_email_aloud: that is the read
+        path for RECEIVED mail, and it clears pending_search and overwrites
+        last_read — which would silently destroy the very referent a reply was
+        resolved from, mid-send.
+        """
+        self._speak_confirmation(
+            f"Here's what I've got. To {sanitize_body_text(name)}, at "
+            f"{self._spell_email_for_speech(address)}. "
+            f"Subject: {sanitize_body_text(draft['subject'])}. "
+            f"{sanitize_body_text(draft['body'])}"
+        )
+
+    def _handle_send_email(self, email_ctx: dict, text: str) -> None:
+        """
+        The send sub-dialogue: parse → resolve recipient → resolve account →
+        draft → confirm → send. Every exit that isn't an explicit "yes" leaves
+        the mailbox untouched.
+        """
+        self._set_state(AssistantState.THINKING)
+        parsed = self._email.classify_send(text, last_read=email_ctx.get("last_read"))
+
+        try:
+            resolved = self._resolve_recipient(parsed, email_ctx)
+            if resolved is None:
+                return  # the resolver already said why
+            name, address = resolved
+
+            account = self._resolve_send_account(parsed["account_hint"])
+            if account is None:
+                return
+
+            message = _clean(parsed["message"])
+            if not message:
+                message = self._ask_and_listen(
+                    f"What would you like to say to {name}?",
+                    silence_timeout=ADDRESS_ENTRY_SILENCE_TIMEOUT,
+                ).strip()
+                if not message:
+                    self._speak_confirmation("No problem — I haven't sent anything.")
+                    return
+
+            reply_to = email_ctx.get("last_read") if parsed["is_reply"] else None
+            subject_hint = parsed["subject_hint"]
+
+            self._speak_confirmation("Let me put that together.")
+            self._set_state(AssistantState.THINKING)
+            draft = self._email.draft_email(
+                message, name, subject_hint=subject_hint, reply_to=reply_to
+            )
+
+            self._confirm_and_send(
+                name, address, account, draft, message, subject_hint, reply_to
+            )
+        finally:
+            # Belt and braces: _capture_email_address closes this too, but an
+            # exception anywhere above must not leave the dashboard prompting
+            # for an address nobody is waiting on.
+            self._email.close_contact_request()
+
+    def _confirm_and_send(
+        self, name: str, address: str, account: dict, draft: dict,
+        message: str, subject_hint: str | None, reply_to: dict | None,
+    ) -> None:
+        """
+        The mandatory gate. Reads the draft aloud and sends ONLY on an
+        unambiguous affirmative. A revision request re-drafts and re-confirms
+        rather than starting over or giving up; silence, hesitation, and any
+        answer the classifier isn't sure about re-ask once and then cancel.
+
+        There is no path from "unclear" to a send.
+        """
+        revisions = 0
+
+        while True:
+            self._speak_draft(name, address, draft)
+            answer = self._ask_and_listen(
+                "Should I send it?", silence_timeout=SEND_CONFIRM_SILENCE_TIMEOUT
+            )
+            self._set_state(AssistantState.THINKING)
+            verdict = self._email.classify_confirmation(answer)
+
+            # Each freshly-read draft gets its own allowance of unclear answers:
+            # a hesitation about draft #2 shouldn't be held against draft #1.
+            unclear_rounds = 0
+            while verdict not in (CONFIRM_YES, CONFIRM_NO, CONFIRM_REVISE):
+                unclear_rounds += 1
+                if unclear_rounds >= MAX_SEND_CONFIRM_ROUNDS:
+                    self._speak_confirmation(
+                        "I didn't get a clear answer, so I haven't sent it. "
+                        "Just ask me again when you're ready."
+                    )
+                    return
+                answer = self._ask_and_listen(
+                    "Sorry — should I send it? Yes or no.",
+                    silence_timeout=SEND_CONFIRM_SILENCE_TIMEOUT,
+                )
+                self._set_state(AssistantState.THINKING)
+                verdict = self._email.classify_confirmation(answer)
+
+            if verdict == CONFIRM_NO:
+                self._speak_confirmation("Alright, I won't send it.")
+                return
+
+            if verdict == CONFIRM_REVISE:
+                revisions += 1
+                if revisions > MAX_SEND_REVISION_ROUNDS:
+                    self._speak_confirmation(
+                        "I'm not getting this quite right — let's start it over "
+                        "another time. I haven't sent anything."
+                    )
+                    return
+                self._speak_confirmation("Sure — one moment.")
+                self._set_state(AssistantState.THINKING)
+                draft = self._email.draft_email(
+                    message, name, subject_hint=subject_hint, reply_to=reply_to,
+                    prior_draft=draft, revision=answer,
+                )
+                continue  # read the revised draft back and confirm again
+
+            # CONFIRM_YES — the only path that reaches the network.
+            self._set_state(AssistantState.THINKING)
+            try:
+                self._email.send_email(account["id"], address, draft["subject"], draft["body"])
+            except Exception as exc:
+                logger.error(f"[Send] Failed to send to {address}: {type(exc).__name__}: {exc}")
+                self._speak_confirmation(
+                    f"I couldn't send it — {self._describe_send_failure(exc)} "
+                    "Nothing was sent."
+                )
+                return
+            self._speak_confirmation(f"Sent to {sanitize_body_text(name)}.")
+            return
+
+    @staticmethod
+    def _describe_send_failure(exc: Exception) -> str:
+        """
+        A short spoken reason for a failed send. Never echoes the raw exception
+        — SMTP errors carry hostnames and usernames, and the Gmail API's carry
+        full request URLs. The full detail is logged; the boss hears only what
+        tells him what to do next.
+
+        Order matters: smtplib.SMTPException subclasses OSError, so the
+        specific SMTP cases must be tested before the catch-all network one.
+        """
+        if isinstance(exc, smtplib.SMTPAuthenticationError):
+            return "that account rejected the login for sending."
+        if isinstance(exc, smtplib.SMTPRecipientsRefused):
+            return "the server wouldn't accept that recipient address."
+        if isinstance(exc, smtplib.SMTPConnectError):
+            return "I couldn't reach the outgoing mail server."
+        if isinstance(exc, smtplib.SMTPException):
+            return "the mail server refused the message."
+        if isinstance(exc, OSError):  # sockets, TLS, DNS, timeouts
+            return "I couldn't reach the outgoing mail server."
+        return "something went wrong on the way out."
 
     # ── Wake word callback ────────────────────────────────────────────────────
 
@@ -1233,7 +1756,10 @@ class JarvisAssistant:
         first listen uses the follow-up timeout rather than STT's default,
         since the boss wasn't explicitly asked to speak.
         """
-        email_ctx: dict = {"last_listed": [], "announced": [], "pending_search": None, "last_read": None}
+        email_ctx: dict = {
+            "last_listed": [], "announced": [], "pending_search": None,
+            "last_read": None, "account_focus": None, "oldest_shown": None,
+        }
         try:
             # ── 1. Stop detector to free the mic ─────────────────────────────
             logger.info("Wake word detected! Stopping wake detector to free mic…")
@@ -1314,9 +1840,16 @@ class JarvisAssistant:
                     continue
 
                 # ── 3e. Get Claude's response ─────────────────────────────────
+                # email_context is recomputed every turn (a cheap in-memory
+                # read of the live account store), so a just-connected account
+                # is reflected immediately — no restart, even mid-conversation.
                 self._set_state(AssistantState.THINKING)
                 logger.info("[Thinking] Sending to Claude…")
-                reply = self._llm.get_response(text, memory_context=memory_context)
+                reply = self._llm.get_response(
+                    text,
+                    memory_context=memory_context,
+                    email_context=self._email.get_accounts_context(),
+                )
                 self._emit_event("llm_response", text=reply)
 
                 # ── 3f. Speak the response ────────────────────────────────────
@@ -1345,6 +1878,15 @@ class JarvisAssistant:
                 name="jarvis-memory-extraction",
                 daemon=True,
             ).start()
+
+            # A send flow that died mid-flight (or a conversation that ended
+            # while one was open) must not leave the dashboard prompting for a
+            # contact address nobody is waiting on. _handle_send_email closes
+            # this in its own finally too; this is the backstop, and it is the
+            # only send state that outlives the handler — everything else lives
+            # in locals, which is why no pending_send can leak between
+            # conversations. Idempotent.
+            self._email.close_contact_request()
 
             # ── 5. Restart the wake detector — unless stop() ran while this
             #      conversation was in flight, in which case it already tore

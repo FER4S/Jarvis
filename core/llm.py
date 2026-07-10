@@ -101,7 +101,9 @@ class LLMEngine:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def get_response(self, user_text: str, memory_context: str = "") -> str:
+    def get_response(
+        self, user_text: str, memory_context: str = "", email_context: str = ""
+    ) -> str:
         """
         Send the user's transcribed speech to Claude and return its reply.
 
@@ -117,6 +119,12 @@ class LLMEngine:
                 The actual current date and time (config.TIMEZONE) are always
                 included in the system prompt for every call, regardless of
                 whether memory_context is given.
+            email_context: Optional one-line summary of the connected email
+                accounts (from EmailManager.get_accounts_context()), appended
+                to the system prompt for this call only. Lets conversational
+                questions that fall through to Claude ("how many accounts are
+                connected?", "do you have my Gmail?") be answered from real
+                data instead of confabulated.
 
         Returns:
             Claude's plain-text reply, or a fallback string on error.
@@ -137,6 +145,8 @@ class LLMEngine:
         )
         if memory_context:
             effective_system_prompt += f"\n\n[What I remember about you] {memory_context}"
+        if email_context:
+            effective_system_prompt += f"\n\n[Your connected email accounts] {email_context}"
 
         try:
             response = self._client.messages.create(

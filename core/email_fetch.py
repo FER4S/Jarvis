@@ -24,7 +24,7 @@ import email
 import os
 import sys
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email import policy as email_policy
 from email.header import decode_header
 from email.utils import parseaddr, parsedate_to_datetime
@@ -209,6 +209,35 @@ def html_to_text(html_content: str) -> str:
     return "\n".join(collapsed).strip()
 
 
+def build_gmail_service(creds: dict):
+    """
+    Build an authenticated Gmail API client from a stored account's
+    credentials. `token=None` is deliberate: google-auth lazily mints a fresh
+    access token from the refresh token on the first call, so nothing
+    short-lived is ever persisted.
+
+    Module-level rather than a GmailFetcher method because core/email_send.py
+    needs the identical client to call messages().send() - the reading and
+    sending paths share one OAuth grant and must share one way of using it.
+    """
+    if not config.GOOGLE_OAUTH_CLIENT_ID or not config.GOOGLE_OAUTH_CLIENT_SECRET:
+        raise ValueError(
+            "GOOGLE_OAUTH_CLIENT_ID/GOOGLE_OAUTH_CLIENT_SECRET are not configured - "
+            "cannot refresh a Gmail access token."
+        )
+    credentials = Credentials(
+        token=None,
+        refresh_token=creds["refresh_token"],
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=config.GOOGLE_OAUTH_CLIENT_ID,
+        client_secret=config.GOOGLE_OAUTH_CLIENT_SECRET,
+    )
+    # cache_discovery=False: avoids googleapiclient's on-disk discovery
+    # cache, which warns/misbehaves on some Python versions and buys
+    # nothing for a locally-run assistant.
+    return build("gmail", "v1", credentials=credentials, cache_discovery=False)
+
+
 # ── Fetcher contract ──────────────────────────────────────────────────────────
 
 class EmailFetcher(Protocol):
@@ -228,14 +257,18 @@ class EmailFetcher(Protocol):
         sender: str | None = None,
         subject: str | None = None,
         unread_only: bool = False,
+        before: "date | None" = None,
     ) -> list[dict]:
         """
         On-demand historical search ("any email from two weeks ago?") over an
         arbitrary lookback window. Filters are pushed server-side wherever the
         provider supports it, so the max_n cap can't swallow the match.
-        Returns normalized dicts, newest first. Raises on connection/auth
-        failure - callers catch per account. Must never mutate mailbox state
-        (nothing may get marked read).
+        `before` (a date) bounds the newest end - messages strictly before that
+        date - which is what "load earlier emails" pages back with. Both
+        providers are date-granular here, so callers still apply an exact
+        datetime filter on the results. Returns normalized dicts, newest first.
+        Raises on connection/auth failure - callers catch per account. Must
+        never mutate mailbox state (nothing may get marked read).
         """
         ...
 
@@ -323,6 +356,7 @@ class ImapFetcher:
         sender: str | None = None,
         subject: str | None = None,
         unread_only: bool = False,
+        before: date | None = None,
     ) -> list[dict]:
         creds = account["credentials"]
         account_id = account["id"]
@@ -330,6 +364,11 @@ class ImapFetcher:
 
         since_date = (datetime.now(timezone.utc) - timedelta(days=days)).date()
         criteria: list = ["SINCE", since_date]
+        if before:
+            # IMAP BEFORE is date-granular and exclusive: messages earlier than
+            # this date. Callers pass anchor_date + 1 day and then filter on the
+            # exact datetime, so same-day-but-older messages aren't lost.
+            criteria.extend(["BEFORE", before])
         if sender:
             criteria.extend(["FROM", sender])
         if subject:
@@ -365,6 +404,11 @@ class ImapFetcher:
                     f"retrying unfiltered and filtering locally."
                 )
                 fallback_criteria: list = ["SINCE", since_date]
+                if before:
+                    # Keep the date bound: dropping it would page FORWARD into
+                    # newer mail instead of older, which is never what the
+                    # caller asked for. Only the text filters are lenient here.
+                    fallback_criteria.extend(["BEFORE", before])
                 if unread_only:
                     fallback_criteria.append("UNSEEN")
                 uids = client.search(fallback_criteria)
@@ -498,7 +542,7 @@ class GmailFetcher:
         creds = account["credentials"]
         account_id = account["id"]
         account_label = account["label"]
-        service = self._build_service(creds)
+        service = build_gmail_service(creds)
 
         list_response = (
             service.users()
@@ -541,17 +585,22 @@ class GmailFetcher:
         sender: str | None = None,
         subject: str | None = None,
         unread_only: bool = False,
+        before: date | None = None,
     ) -> list[dict]:
         creds = account["credentials"]
         account_id = account["id"]
         account_label = account["label"]
-        service = self._build_service(creds)
+        service = build_gmail_service(creds)
 
         # Filters ride in the Gmail query so the maxResults cap can't swallow
         # the match. Note Gmail's subject: matches whole tokens, not arbitrary
         # substrings - acceptable for spoken topic cues. Embedded quotes are
         # stripped so a value can't break out of its quoted term.
         q_parts = [f"in:inbox newer_than:{days}d"]
+        if before:
+            # Gmail before: is date-granular and exclusive; the caller passes
+            # anchor_date + 1 day and filters the exact datetime afterwards.
+            q_parts.append(f"before:{before:%Y/%m/%d}")
         if sender:
             cleaned = sender.replace('"', "")
             q_parts.append(f'from:"{cleaned}"')
@@ -586,25 +635,6 @@ class GmailFetcher:
 
         emails.sort(key=lambda e: e["date"], reverse=True)
         return emails
-
-    @staticmethod
-    def _build_service(creds: dict):
-        if not config.GOOGLE_OAUTH_CLIENT_ID or not config.GOOGLE_OAUTH_CLIENT_SECRET:
-            raise ValueError(
-                "GOOGLE_OAUTH_CLIENT_ID/GOOGLE_OAUTH_CLIENT_SECRET are not configured - "
-                "cannot refresh a Gmail access token."
-            )
-        credentials = Credentials(
-            token=None,
-            refresh_token=creds["refresh_token"],
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=config.GOOGLE_OAUTH_CLIENT_ID,
-            client_secret=config.GOOGLE_OAUTH_CLIENT_SECRET,
-        )
-        # cache_discovery=False: avoids googleapiclient's on-disk discovery
-        # cache, which warns/misbehaves on some Python versions and buys
-        # nothing for a locally-run assistant.
-        return build("gmail", "v1", credentials=credentials, cache_discovery=False)
 
     @staticmethod
     def _parse_message(full: dict, account_id: str, account_label: str) -> dict:
@@ -643,7 +673,7 @@ class GmailFetcher:
     def test_connection(self, credentials: dict) -> None:
         """Raises on any auth/refresh failure - used to validate an account
         before it's stored, and reused when re-checking a stored account."""
-        service = self._build_service(credentials)
+        service = build_gmail_service(credentials)
         service.users().getProfile(userId="me").execute()
 
 

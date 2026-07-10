@@ -288,24 +288,42 @@ class EmailAccountStore:
         username: str,
         password: str,
         use_ssl: bool = True,
+        smtp_host: str | None = None,
+        smtp_port: int | None = None,
+        smtp_use_ssl: bool = True,
     ) -> dict:
         """
         Add a new IMAP account and save immediately. Returns the SAFE view
         (no credentials) - callers needing the credentials back should use
-        get()/list_all() instead (the fetch/poll path only).
+        get()/list_all() instead (the fetch/send path only).
+
+        The smtp_* fields are optional and only needed when the outgoing host
+        can't be derived from the incoming one. Left unset, core/email_send.py
+        derives it at send time (imap.example.com -> smtp.example.com:465), so
+        accounts stored before sending existed keep working with no migration
+        and no re-add. `credentials` stays an opaque dict as far as this store
+        is concerned.
         """
+        credentials = {
+            "host": host.strip(),
+            "port": int(port),
+            "username": username.strip(),
+            "password": password,
+            "use_ssl": bool(use_ssl),
+        }
+        if smtp_host:
+            credentials["smtp_host"] = smtp_host.strip()
+        if smtp_port:
+            credentials["smtp_port"] = int(smtp_port)
+        if smtp_host or smtp_port:
+            credentials["smtp_use_ssl"] = bool(smtp_use_ssl)
+
         account = {
             "id": uuid.uuid4().hex,
             "label": label.strip() or host,
             "provider": PROVIDER_IMAP,
             "created_at": datetime.now(config.TIMEZONE).isoformat(),
-            "credentials": {
-                "host": host.strip(),
-                "port": int(port),
-                "username": username.strip(),
-                "password": password,
-                "use_ssl": bool(use_ssl),
-            },
+            "credentials": credentials,
         }
         with self._lock:
             self._accounts.append(account)

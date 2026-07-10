@@ -37,14 +37,20 @@ from google.auth.exceptions import RefreshError
 from loguru import logger
 
 import config
-from core.email_accounts import EmailAccountStore, PROVIDER_IMAP
+from core.email_accounts import EmailAccountStore, PROVIDER_GMAIL, PROVIDER_IMAP
 from core.email_fetch import (
     FETCH_WINDOW_DAYS,
     PROVIDER_FETCHERS,
     sanitize_body_text,
     truncate_text,
 )
-from core.memory import EXTRACTION_MODEL_ID, extract_response_text, parse_json_object
+from core.email_send import PROVIDER_SENDERS, reply_subject
+from core.memory import (
+    EXTRACTION_MODEL_ID,
+    extract_response_text,
+    is_valid_email,
+    parse_json_object,
+)
 
 # ── Storage location (cache only - accounts live in email_accounts.py) ──────
 _DATA_DIR: str = os.path.join(_PROJECT_ROOT, "data")
@@ -104,11 +110,35 @@ DEEP_SEARCH_MAX_MESSAGES: int = 30  # per account, per search
 # cache, which is the actual bug a null days_back silently causes.
 VAGUE_TIMEFRAME_DAYS_BACK_DEFAULT: int = 30
 
+# ── Sending ───────────────────────────────────────────────────────────────────
+# A drafted email is spoken aloud in full before the boss confirms it, so the
+# body must stay short enough to listen to without losing the thread.
+DRAFT_MAX_TOKENS: int = 400
+# Cap on how much of the email being replied to is shown to the drafting model.
+DRAFT_REPLY_BODY_CAP: int = 1500
+# One word ("yes"/"no"/"revise"/"unclear"); mirrors memory.CLASSIFY_MAX_TOKENS.
+CONFIRM_MAX_TOKENS: int = 10
+SEND_PARSE_MAX_TOKENS: int = 300
+ADDRESS_PARSE_MAX_TOKENS: int = 60
+
+# How long a "waiting for an address" request stays open for the dashboard to
+# fulfil. Long enough to find the window and type; short enough that a request
+# abandoned by a crashed conversation can't outlive the boss's memory of it.
+# The voice handler closes it in a finally regardless.
+CONTACT_REQUEST_TTL_S: float = 180.0
+
 _VALID_INTENTS: frozenset[str] = frozenset({
     "not_email", "check_new", "check_now", "list_emails", "from_person",
     "read_email", "email_question", "summarize", "action_needed",
-    "meetings_mentioned", "send_email", "dismiss",
+    "meetings_mentioned", "send_email", "dismiss", "load_more",
 })
+
+# classify_confirmation()'s three real answers plus the safe default. Only
+# "yes" ever authorizes an irreversible send.
+CONFIRM_YES: str = "yes"
+CONFIRM_NO: str = "no"
+CONFIRM_REVISE: str = "revise"
+CONFIRM_UNCLEAR: str = "unclear"
 
 
 def _clean_str(value) -> str:
@@ -160,6 +190,11 @@ class EmailManager:
         # "check now" from interleaving seen_ids updates with a scheduled cycle.
         self._cycle_lock = threading.Lock()
         self._oauth_lock = threading.Lock()
+        # Guards the single pending "waiting for a contact's address" slot,
+        # which the voice thread opens and the API thread (a typed dashboard
+        # submission) fulfils. Distinct from _oauth_lock so a slow OAuth
+        # callback can't block a live conversation.
+        self._contact_lock = threading.Lock()
         # Guards one-time initialize() and poll-thread startup - both are
         # called from two independent races (assistant.run() and the server
         # lifespan; see module docstring).
@@ -172,6 +207,10 @@ class EmailManager:
 
         self._oauth_states: dict[str, float] = {}
         self._last_announced_context: list[dict] = []
+        # At most one open contact request at a time. Safe because
+        # conversations are strictly serial by construction: the dispatch loop
+        # joins each jarvis-conversation thread before starting the next.
+        self._contact_request: dict | None = None
 
         if not api_key:
             logger.warning(
@@ -505,15 +544,80 @@ class EmailManager:
     def has_accounts(self) -> bool:
         return len(self._store.list_safe()) > 0
 
+    def list_accounts_safe(self) -> list[dict]:
+        """Credential-free account views (id/label/provider/created_at)."""
+        return self._store.list_safe()
+
+    def resolve_accounts_by_hint(self, account_hint: str | None) -> list[dict]:
+        """
+        Safe account views matching a spoken account name. No hint returns
+        every account, so the caller decides between "use the only one" and
+        "ask which". Same case-insensitive label-or-provider substring rule
+        get_cached_emails() applies, so "Gmail" hits the gmail_oauth provider
+        and "Hostinger" hits a label.
+        """
+        accounts = self._store.list_safe()
+        hint = _clean_str(account_hint).lower()
+        if not hint:
+            return accounts
+        return [
+            a for a in accounts
+            if hint in a["label"].lower() or hint in a["provider"].lower()
+        ]
+
+    def get_accounts_context(self) -> str:
+        """
+        An authoritative one-line summary of the connected email accounts,
+        for injection into the conversational LLM's system prompt so it can
+        answer "how many / which email accounts are connected?", "do you have
+        my Gmail?" etc. from real data instead of confabulating. Reads the
+        live in-memory store, so a just-added account is reflected with no
+        restart. Never raises.
+        """
+        accounts = self._store.list_safe()
+        if not accounts:
+            return "No email accounts are connected yet."
+        parts = []
+        for a in accounts:
+            kind = "Gmail" if a.get("provider") == PROVIDER_GMAIL else "IMAP"
+            parts.append(f"{a.get('label')} ({kind})")
+        return (
+            "You have live access to these connected email accounts: "
+            + ", ".join(parts)
+            + ". They are ALL fully connected and ready to use right now — there is "
+            "no syncing, importing, indexing, or setup still in progress, so never "
+            "tell the user an account is still syncing, loading, or connecting. You "
+            "can read, search, and summarize their mail through your email tools. If "
+            "the user asks how many or which email accounts are connected, answer from "
+            "this list and refer to each account by the label shown above."
+        )
+
     def add_imap_account(
-        self, label: str, host: str, port: int, username: str, password: str, use_ssl: bool = True
+        self, label: str, host: str, port: int, username: str, password: str, use_ssl: bool = True,
+        smtp_host: str | None = None, smtp_port: int | None = None, smtp_use_ssl: bool = True,
     ) -> dict:
         """Validates the connection BEFORE storing - raises whatever the
-        fetcher raised on failure; the API endpoint maps that to a sanitized 400."""
-        PROVIDER_FETCHERS[PROVIDER_IMAP].test_connection(
-            {"host": host, "port": port, "username": username, "password": password, "use_ssl": use_ssl}
+        fetcher raised on failure; the API endpoint maps that to a sanitized 400.
+
+        The outgoing (SMTP) server is validated too, but ONLY when smtp_host
+        was explicitly supplied. Otherwise it is derived at send time and never
+        probed here, so adding an account for reading can't start failing
+        because its mail host happens not to accept SMTP logins."""
+        credentials = {
+            "host": host, "port": port, "username": username,
+            "password": password, "use_ssl": use_ssl,
+        }
+        PROVIDER_FETCHERS[PROVIDER_IMAP].test_connection(credentials)
+
+        if smtp_host:
+            PROVIDER_SENDERS[PROVIDER_IMAP].test_connection({
+                **credentials,
+                "smtp_host": smtp_host, "smtp_port": smtp_port, "smtp_use_ssl": smtp_use_ssl,
+            })
+
+        account = self._store.add_imap_account(
+            label, host, port, username, password, use_ssl, smtp_host, smtp_port, smtp_use_ssl
         )
-        account = self._store.add_imap_account(label, host, port, username, password, use_ssl)
         self.request_poll_soon()
         return account
 
@@ -563,6 +667,90 @@ class EmailManager:
         with self._oauth_lock:
             expiry = self._oauth_states.pop(state, None)
         return expiry is not None and expiry > now
+
+    # ── Pending contact-address request (voice thread <-> API thread) ─────────
+    #
+    # Email addresses are hard for STT: symbols, dots, unusual spellings. When
+    # the send flow needs an address it doesn't have, it opens a request here
+    # and asks aloud. The boss may answer by voice (the default) OR type it
+    # into the dashboard, which POSTs to /email/pending-contact and lands in
+    # this slot. The voice path never depends on the typed one - the UI is
+    # strictly optional.
+    #
+    # Same shape as the OAuth nonce store above: one lock, a TTL, and an
+    # atomic claim (cf. claim_announcement).
+
+    def open_contact_request(self, person_name: str) -> None:
+        """Begin waiting for `person_name`'s address. Overwrites any stale
+        slot - only one conversation can be in flight at a time."""
+        with self._contact_lock:
+            self._contact_request = {
+                "name": _clean_str(person_name),
+                "expires_at": time.time() + CONTACT_REQUEST_TTL_S,
+                "email": None,
+            }
+
+    def _live_contact_request_locked(self) -> dict | None:
+        """The open request, or None if absent/expired. Assumes the lock is held."""
+        request = self._contact_request
+        if request is None:
+            return None
+        if request["expires_at"] <= time.time():
+            self._contact_request = None
+            return None
+        return request
+
+    def get_contact_request(self) -> dict | None:
+        """{"name", "expires_in"} for the dashboard to render an input box, or
+        None when Jarvis isn't waiting on an address."""
+        with self._contact_lock:
+            request = self._live_contact_request_locked()
+            if request is None:
+                return None
+            return {
+                "name": request["name"],
+                "expires_in": max(0, int(request["expires_at"] - time.time())),
+            }
+
+    def submit_contact_email(self, address: str) -> bool:
+        """
+        Fulfil the open request with a typed address (API thread). Returns
+        False when nothing is pending/it expired, or the address is malformed -
+        the endpoint maps those to 409 and 400 respectively.
+
+        A second submission simply replaces an unclaimed first one, so a typo
+        corrected before Jarvis reads it does the right thing.
+        """
+        address = _clean_str(address)
+        if not is_valid_email(address):
+            return False
+        with self._contact_lock:
+            request = self._live_contact_request_locked()
+            if request is None:
+                return False
+            request["email"] = address
+        logger.info("A contact address was submitted from the dashboard.")
+        return True
+
+    def claim_contact_email(self) -> str | None:
+        """
+        Atomically take any typed address (voice thread). Pops only the VALUE
+        and leaves the request OPEN, so a boss whose first attempt had a typo
+        can type again on the next round without the endpoint 409-ing.
+        """
+        with self._contact_lock:
+            request = self._live_contact_request_locked()
+            if request is None:
+                return None
+            address, request["email"] = request["email"], None
+        return address
+
+    def close_contact_request(self) -> None:
+        """Always called from the send handler's finally, and again from
+        _run_conversation's, so an abandoned request can never linger into an
+        unrelated later conversation. Idempotent."""
+        with self._contact_lock:
+            self._contact_request = None
 
     # ── Voice: intent classification ─────────────────────────────────────────
 
@@ -713,6 +901,10 @@ class EmailManager:
                 "filled in from the cue.\n"
                 "- A declination (\"no\", \"no thanks\", \"not now\", \"never mind\", "
                 "\"later\") means dismiss.\n"
+                "- A request for MORE emails, OLDER than the ones listed above "
+                "(\"load earlier emails\", \"show me older ones\", \"what else\", "
+                "\"more\", \"go further back\", \"the previous ones\", \"anything "
+                "before those\") means load_more - NOT a fresh list_emails.\n"
                 "- Short replies that only make sense as answers to this list must "
                 "NOT be classified not_email. An unrelated request (\"read me a "
                 "poem\", \"what's the weather\") is still not_email."
@@ -720,6 +912,9 @@ class EmailManager:
             dismiss_line = (
                 "- dismiss: the user is declining the emails the assistant just "
                 "offered (\"no thanks\", \"not now\", \"never mind\").\n"
+                "- load_more: the user wants MORE emails, older than the ones just "
+                "listed above (\"load earlier emails\", \"show me older ones\", "
+                "\"more\", \"what else\", \"go further back\").\n"
             )
 
         try:
@@ -753,7 +948,11 @@ class EmailManager:
                     "(\"summarize it\", \"give me the gist\").\n"
                     "- action_needed: asking whether anything in their email needs action/response.\n"
                     "- meetings_mentioned: asking whether any meetings are mentioned in their email.\n"
-                    "- send_email: wants to send/reply/forward an email (NOT supported yet).\n"
+                    "- send_email: wants to SEND a new email, or REPLY to an email being "
+                    "discussed (\"email Michael and tell him I'm running late\", \"send "
+                    "Sarah a note about the budget\", \"reply to it and say I'll review "
+                    "it tonight\"). Recipient and message content are extracted by a "
+                    "separate call - do not try to fill them in here.\n"
                     f"{dismiss_line}\n"
                     "Respond with ONLY a JSON object (no markdown fences, no commentary) with "
                     "exactly these keys: intent (one of the above), account_hint (string or "
@@ -1029,6 +1228,70 @@ class EmailManager:
         results.sort(key=lambda e: e["date"], reverse=True)
         return results[:limit]
 
+    def get_older_emails(
+        self,
+        account_hint: str | None = None,
+        before_date: str | None = None,
+        sender: str | None = None,
+        limit: int = 5,
+    ) -> list[dict]:
+        """
+        Emails strictly OLDER than `before_date` (an ISO date string, normally
+        the oldest email already read aloud) — this is what "load earlier
+        emails" pages back with. Live provider-side search bounded by a
+        `before` date, so it never just re-returns the newest mail the boss
+        already heard.
+
+        Same statelessness invariant as get_emails_for_scope: never reads or
+        writes the poll cache, seen_ids, or announcement state, and holds no
+        manager locks during network calls.
+        """
+        if not before_date:
+            return []
+        try:
+            anchor = datetime.fromisoformat(before_date)
+        except (ValueError, TypeError):
+            return []
+
+        # Provider `before`/BEFORE bounds are date-granular and exclusive, so
+        # ask for anchor_date + 1 day and drop same-day-but-newer messages with
+        # the exact datetime filter below.
+        before_param = anchor.astimezone(config.TIMEZONE).date() + timedelta(days=1)
+
+        accounts = self._store.list_all()
+        if account_hint:
+            hint_lower = account_hint.lower()
+            accounts = [
+                a for a in accounts
+                if hint_lower in a["label"].lower() or hint_lower in a["provider"].lower()
+            ]
+
+        results: list[dict] = []
+        for account in accounts:
+            fetcher = PROVIDER_FETCHERS.get(account["provider"])
+            if fetcher is None:
+                continue
+            try:
+                results.extend(fetcher.search(
+                    account,
+                    days=DEEP_SEARCH_MAX_DAYS,
+                    max_n=DEEP_SEARCH_MAX_MESSAGES,
+                    sender=sender,
+                    before=before_param,
+                ))
+            except Exception as exc:
+                logger.warning(f"Older-email search failed for '{account['label']}': {exc}")
+
+        older: list[dict] = []
+        for e in results:
+            try:
+                if datetime.fromisoformat(e["date"]) < anchor:
+                    older.append(e)
+            except (ValueError, TypeError):
+                continue
+        older.sort(key=lambda e: e["date"], reverse=True)
+        return older[:limit]
+
     @staticmethod
     def _matches_timeframe(date_iso: str, timeframe: str) -> bool:
         try:
@@ -1160,6 +1423,343 @@ class EmailManager:
         except Exception as exc:
             logger.warning(f"answer_email_question() failed ({exc}).")
             return "I couldn't work that out from the email just now."
+
+    # ── Voice: sending ────────────────────────────────────────────────────────
+    #
+    # A bad send cannot be undone, so every model call on this path is built to
+    # fail toward NOT sending: classify_send() falls back to an empty parse,
+    # classify_confirmation() falls back to "unclear" (never "yes"), and
+    # parse_spoken_email_address() returns None rather than a guess.
+
+    @staticmethod
+    def _empty_send_parse() -> dict:
+        return {
+            "recipient": None, "message": None, "subject_hint": None,
+            "account_hint": None, "is_reply": False,
+        }
+
+    def classify_send(self, text: str, last_read: dict | None = None) -> dict:
+        """
+        Extract who to email and what to say from a spoken send request. One
+        Haiku call, fully defaulted, never raises.
+
+        Deliberately SEPARATE from classify_intent rather than folded into its
+        field set: that prompt is a heavily-tuned artifact of the reading build,
+        and its "exactly these keys" contract is load-bearing. Keeping send
+        extraction here means a change to it can never regress reading. This
+        mirrors the existing classify_scope() precedent and only ever runs after
+        classify_intent has already returned send_email, so it costs nothing on
+        a read turn.
+
+        `last_read` is the email currently in focus (email_ctx["last_read"] -
+        the same referent "who sent it?" resolves against). Naming it in the
+        prompt is what lets "reply to it and say I'll review it tonight" come
+        back as is_reply=True with the message extracted and no recipient.
+        """
+        fallback = self._empty_send_parse()
+        text = text.strip()
+        if not text:
+            return fallback
+
+        account_labels = [a["label"] for a in self._store.list_safe()]
+        accounts_desc = ", ".join(account_labels) if account_labels else "(none connected)"
+
+        reply_note = ""
+        if last_read:
+            reply_note = (
+                "\n\nThe user is currently discussing this specific email:\n"
+                f"  From: {_clean_str(last_read.get('sender_name'))} "
+                f"<{_clean_str(last_read.get('sender_email'))}>\n"
+                f"  Subject: \"{_truncate_for_prompt(_clean_str(last_read.get('subject')), 80)}\"\n"
+                "If they are asking to reply to THAT email (\"reply to it\", \"reply and "
+                "say...\", \"tell them...\", \"answer him\"), set is_reply true and leave "
+                "recipient null - the sender above is already known. If they name a "
+                "DIFFERENT person to email, set is_reply false and fill in recipient."
+            )
+
+        try:
+            response = self._client.messages.create(
+                model=INTENT_MODEL_ID,
+                max_tokens=SEND_PARSE_MAX_TOKENS,
+                timeout=INTENT_TIMEOUT,
+                system=(
+                    "The user asked a voice assistant to send an email. Extract the "
+                    f"details. Connected email accounts: {accounts_desc}.{reply_note}\n\n"
+                    "Respond with ONLY a JSON object (no markdown fences, no commentary) "
+                    "with exactly these keys:\n"
+                    "- recipient (string or null): who the email should go TO, as the user "
+                    "said it - a person's name (\"Michael\", \"Sarah Chen\") or a literal "
+                    "email address if they spelled one out. Null if they didn't say, or if "
+                    "this is a reply to the email above.\n"
+                    "- message (string or null): what the user wants the email to SAY, in "
+                    "their own words (\"I want to have a meeting at 5pm\", \"I'll review it "
+                    "tonight\"). This is the instruction to a drafter, not a subject line. "
+                    "Null if they only said who to email and not what.\n"
+                    "- subject_hint (string or null): a subject or topic ONLY if they "
+                    "explicitly stated one (\"subject it 'Q3 budget'\", \"about the "
+                    "budget\"). Do not invent one from the message.\n"
+                    "- account_hint (string or null): an account label or provider name "
+                    "ONLY if the user explicitly said which account to send from; never "
+                    "fill it in just because accounts exist.\n"
+                    "- is_reply (true/false): true only when replying to the email shown "
+                    "above. False when starting a fresh email to someone.\n\n"
+                    "Extract only what was actually said. Never invent a recipient, an "
+                    "email address, or message content the user did not express."
+                ),
+                messages=[{"role": "user", "content": text}],
+            )
+            parsed = parse_json_object(extract_response_text(response))
+            if not isinstance(parsed, dict):
+                return fallback
+
+            result = self._empty_send_parse()
+            for key in ("recipient", "message", "subject_hint", "account_hint"):
+                value = parsed.get(key)
+                if isinstance(value, str) and value.strip():
+                    result[key] = value.strip()
+            result["is_reply"] = bool(parsed.get("is_reply", False))
+            return result
+        except Exception as exc:
+            logger.warning(f"classify_send() failed ({exc}) - no details extracted.")
+            return fallback
+
+    def classify_confirmation(self, answer_text: str) -> str:
+        """
+        Interpret the boss's spoken answer to "should I send it?" (and to the
+        spelled-back-address check). Returns one of CONFIRM_YES / CONFIRM_NO /
+        CONFIRM_REVISE / CONFIRM_UNCLEAR.
+
+        Modeled on memory.classify_same_or_new, including the short-circuit on
+        empty input with no API call. The asymmetry is the whole point and is
+        stronger here than there: only an unambiguous, unqualified affirmative
+        returns "yes". Silence, garble, a hedge, and "yes, but…" all resolve to
+        something that does NOT send. Any exception resolves to "unclear".
+        """
+        if not answer_text.strip():
+            return CONFIRM_UNCLEAR  # silence never authorizes a send; no API call
+
+        try:
+            response = self._client.messages.create(
+                model=INTENT_MODEL_ID,
+                max_tokens=CONFIRM_MAX_TOKENS,
+                timeout=INTENT_TIMEOUT,
+                system=(
+                    "A voice assistant just read a drafted email aloud and asked the user "
+                    "whether to send it. Read the user's reply and answer with ONLY one "
+                    "lowercase word:\n"
+                    "- \"yes\" ONLY if the reply is an unambiguous, unqualified approval to "
+                    "send it right now (\"yes\", \"yeah send it\", \"go ahead\", \"sounds "
+                    "good, send\", \"perfect\").\n"
+                    "- \"no\" if they clearly do not want it sent (\"no\", \"cancel\", "
+                    "\"never mind\", \"don't send it\", \"scrap it\").\n"
+                    "- \"revise\" if they approve of sending in principle but want the "
+                    "email CHANGED first, or ask for any edit to its wording, subject, "
+                    "recipient, or details (\"yes but make it shorter\", \"change the time "
+                    "to six\", \"say it more formally\", \"add that I'll bring the deck\").\n"
+                    "- \"unclear\" for ANYTHING else: hesitation (\"uh\", \"hmm\", \"wait\", "
+                    "\"hold on\"), a contradictory or hedged reply (\"yeah, no\", \"sure I "
+                    "guess\", \"I mean, maybe\"), a question back, an unrelated remark, or "
+                    "anything you are not fully confident about.\n\n"
+                    "Sending an email cannot be undone. When in any doubt, answer "
+                    "\"unclear\" rather than \"yes\". Output only that one word."
+                ),
+                messages=[{"role": "user", "content": answer_text}],
+            )
+            verdict = extract_response_text(response).strip().lower()
+            for candidate in (CONFIRM_REVISE, CONFIRM_YES, CONFIRM_NO):
+                if verdict.startswith(candidate):
+                    return candidate
+            return CONFIRM_UNCLEAR
+        except Exception as exc:
+            logger.warning(f"classify_confirmation() failed ({exc}) - defaulting to 'unclear'.")
+            return CONFIRM_UNCLEAR
+
+    def parse_spoken_email_address(self, text: str) -> str | None:
+        """
+        Turn a spoken address ("feras at codex dot com", "f e r a s at codex
+        dot com") into feras@codex.com. Returns None - never a guess - when the
+        result doesn't validate, so the caller re-asks instead of mailing a
+        stranger.
+
+        Tries a plain regex on the raw transcript first: STT often produces the
+        address verbatim, and that path costs nothing and cannot hallucinate.
+        """
+        text = _clean_str(text)
+        if not text:
+            return None
+
+        literal = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+        if literal and is_valid_email(literal.group(0)):
+            return literal.group(0).lower()
+
+        try:
+            response = self._client.messages.create(
+                model=INTENT_MODEL_ID,
+                max_tokens=ADDRESS_PARSE_MAX_TOKENS,
+                timeout=INTENT_TIMEOUT,
+                system=(
+                    "The user spoke an email address aloud to a voice assistant and it was "
+                    "transcribed imperfectly. Reconstruct the address.\n"
+                    "- \"at\" means @, \"dot\"/\"point\" means a period, \"underscore\" "
+                    "means _, \"dash\"/\"hyphen\" means -, \"plus\" means +.\n"
+                    "- Letters may be spelled out one at a time (\"f e r a s\" or \"f-e-r-a-s\" "
+                    "-> feras); join them with no separator.\n"
+                    "- Ignore surrounding words like \"my email is\" or \"it's\".\n"
+                    "- Lowercase the whole address.\n\n"
+                    "Output ONLY the address, nothing else. If you cannot reconstruct a "
+                    "single complete, plausible email address from the text, output exactly "
+                    "NONE. Never invent a domain or a name that was not spoken."
+                ),
+                messages=[{"role": "user", "content": text}],
+            )
+            candidate = extract_response_text(response).strip().strip("<>\"' ").lower()
+            # The model is only ever trusted through this gate.
+            return candidate if is_valid_email(candidate) else None
+        except Exception as exc:
+            logger.warning(f"parse_spoken_email_address() failed ({exc}).")
+            return None
+
+    def draft_email(
+        self,
+        message: str,
+        recipient_name: str,
+        subject_hint: str | None = None,
+        reply_to: dict | None = None,
+        prior_draft: dict | None = None,
+        revision: str | None = None,
+    ) -> dict:
+        """
+        Draft a short, appropriately professional email from what the boss
+        said - never a verbatim transcript of it. Returns
+        {"subject": str, "body": str}.
+
+        Sonnet tier (EXTRACTION_MODEL_ID), matching how reason_over_emails and
+        summarize_email chose their model: this is heavier writing work, not a
+        realtime classification. max_retries=0 like its siblings, since the boss
+        is waiting; the caller speaks a filler line first.
+
+        `subject_hint` is a subject the boss explicitly dictated; absent one,
+        the model writes its own. `reply_to` is the email being replied to
+        (subject is forced to "Re: <original>", so a hint is ignored there).
+        `prior_draft` + `revision` drive the revise loop - the model edits the
+        existing draft rather than starting over, so "make it shorter" doesn't
+        lose the details from three turns ago.
+
+        Never raises: on failure it returns a plain-but-honest draft built from
+        the boss's own words, which the confirmation step will read back anyway.
+        """
+        fallback_subject = _clean_str(reply_to and reply_to.get("subject")) or "Quick note"
+        if reply_to:
+            fallback_subject = reply_subject(fallback_subject)
+        elif _clean_str(subject_hint):
+            fallback_subject = _clean_str(subject_hint)
+        fallback = {"subject": fallback_subject, "body": _clean_str(message)}
+
+        context_parts = [f"Recipient's name: {recipient_name or '(unknown)'}"]
+        if _clean_str(subject_hint) and not reply_to:
+            context_parts.append(
+                f"Use exactly this subject line: \"{_clean_str(subject_hint)}\""
+            )
+        if reply_to:
+            context_parts.append(
+                "This is a REPLY to the following email. Address the sender by name, "
+                "respond to what they actually wrote, and keep the subject as "
+                f"\"{reply_subject(_clean_str(reply_to.get('subject')))}\".\n"
+                f"  From: {sanitize_body_text(_clean_str(reply_to.get('sender_name')))}\n"
+                f"  Subject: {sanitize_body_text(_clean_str(reply_to.get('subject')))}\n"
+                f"  Body: {sanitize_body_text(_truncate_for_prompt(_clean_str(reply_to.get('body')), DRAFT_REPLY_BODY_CAP))}"
+            )
+        if prior_draft and revision:
+            context_parts.append(
+                "You previously drafted this email:\n"
+                f"  Subject: {_clean_str(prior_draft.get('subject'))}\n"
+                f"  Body: {_clean_str(prior_draft.get('body'))}\n"
+                "The user wants it CHANGED as follows. Apply only that change and keep "
+                f"everything else intact - do not start over:\n  \"{_clean_str(revision)}\""
+            )
+        else:
+            context_parts.append(f"What the user wants to say: \"{_clean_str(message)}\"")
+
+        try:
+            response = self._reasoning_client.messages.create(
+                model=EXTRACTION_MODEL_ID,
+                max_tokens=DRAFT_MAX_TOKENS,
+                timeout=REASONING_TIMEOUT,
+                system=(
+                    "You draft short emails on behalf of a busy professional, from a "
+                    "one-line spoken instruction. Turn the instruction into a real email - "
+                    "never a transcript of what was said.\n\n"
+                    "Rules:\n"
+                    "- Keep it SHORT: a greeting, one to three sentences, and a sign-off. "
+                    "It will be read aloud in full for approval before sending.\n"
+                    "- Tone: warm but professional. Do not be effusive or padded.\n"
+                    "- Write only what the user actually conveyed. Never invent facts, "
+                    "dates, times, commitments, names, or details they did not give you.\n"
+                    "- Sign off as the sender without inventing a name (\"Best,\" on its "
+                    "own line is fine). Never write a placeholder like [Your Name].\n"
+                    "- The subject must be a real subject line: short, specific, no "
+                    "\"Subject:\" prefix.\n"
+                    "- Plain text only. No markdown, no bullet points, no links.\n\n"
+                    "Respond with ONLY a JSON object (no markdown fences, no commentary) "
+                    "with exactly these keys: subject (string), body (string)."
+                ),
+                messages=[{"role": "user", "content": "\n\n".join(context_parts)}],
+            )
+            parsed = parse_json_object(extract_response_text(response))
+            if not isinstance(parsed, dict):
+                return fallback
+
+            subject = _clean_str(parsed.get("subject")) or fallback["subject"]
+            body = _clean_str(parsed.get("body"))
+            if not body:
+                return fallback
+            if reply_to:
+                subject = reply_subject(_clean_str(reply_to.get("subject")))
+            return {"subject": subject, "body": body}
+        except Exception as exc:
+            logger.warning(f"draft_email() failed ({exc}) - falling back to a literal draft.")
+            return fallback
+
+    def get_account_send_identity(self, account_id: str) -> str:
+        """The address an account sends as (its From header). Reads credentials,
+        so like get()/list_all() this is transport-path only - never an API
+        response. Returns "" for an unknown account."""
+        account = self._store.get(account_id)
+        if not account:
+            return ""
+        sender = PROVIDER_SENDERS.get(account["provider"])
+        if sender is None:
+            return ""
+        return sender.sender_address(account["credentials"])
+
+    def send_email(self, account_id: str, to_addr: str, subject: str, body: str) -> None:
+        """
+        Send one email. Raises on any failure - the caller speaks the outcome
+        aloud, so a swallowed error would be indistinguishable from success.
+
+        Stateless, exactly like the deep-search path: it never reads or writes
+        the poll cache, seen_ids, unannounced_ids, last_error, or announcement
+        state, and holds no manager lock across the network call (store.get()
+        locks internally and returns a deep copy). data/email_cache.json must be
+        byte-identical across a send.
+
+        Logs the recipient and subject; never the body, password, or token.
+        """
+        to_addr = _clean_str(to_addr)
+        if not is_valid_email(to_addr):
+            raise ValueError(f"Refusing to send to a malformed address: '{to_addr}'")
+
+        account = self._store.get(account_id)
+        if not account:
+            raise ValueError(f"No such email account: {account_id}")
+        sender = PROVIDER_SENDERS.get(account["provider"])
+        if sender is None:
+            raise ValueError(f"Account '{account['label']}' cannot send email.")
+
+        sender.send(account, to_addr, _clean_str(subject), body)
+        logger.success(
+            f"Email sent from '{account['label']}' to {to_addr} — subject '{subject}'."
+        )
 
     # ── Dashboard ─────────────────────────────────────────────────────────────
 

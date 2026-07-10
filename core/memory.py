@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -69,6 +70,51 @@ _SUMMARY_CHAR_BUDGET: int = int(_SUMMARY_TOKEN_BUDGET * _CHARS_PER_TOKEN)  # 120
 
 # extract_and_save() no-ops below this many user turns - not worth an API call.
 _MIN_USER_TURNS_FOR_EXTRACTION: int = 2
+
+# Conservative address shape. Guards every write to a person's "email" field:
+# that field is what the voice send flow resolves a recipient from, so a
+# malformed value stored here becomes a failed - or misdirected - send.
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+# Same shape, unanchored, for finding an address embedded in free-text notes.
+_EMAIL_SEARCH_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# A dangling "Email:" / "email address is" label left behind once the address
+# after it is removed. Stripped so lifted notes don't read "... Email: ".
+_EMAIL_LABEL_RE = re.compile(
+    r"[,;.]?\s*\b(?:e-?mail(?:\s+address)?)\b\s*(?:is|:)?\s*$", re.IGNORECASE
+)
+
+
+def is_valid_email(value: str) -> bool:
+    """True when `value` looks like a single, complete email address."""
+    return bool(_EMAIL_RE.match(_clean_str(value)))
+
+
+def _split_email_from_notes(notes: str) -> tuple[str, str]:
+    """
+    Pull a single valid email address out of a free-text notes string.
+    Returns (notes_without_the_address, address_lowercased) - or the notes
+    unchanged and "" if there's no valid address in them.
+
+    This is the bridge for the one case the extraction guard would otherwise
+    strand: background extraction is deliberately never told the "email" field
+    exists (so it can't be prompted into inventing an address), which means a
+    real address the boss stated in conversation has nowhere to go but the
+    notes. Lifting it here - an address the model TRANSCRIBED, not one it was
+    asked to produce - lands it in the structured field the send flow reads,
+    while the notes keep whatever non-address context came with it.
+    """
+    notes = _clean_str(notes)
+    if not notes:
+        return notes, ""
+    match = _EMAIL_SEARCH_RE.search(notes)
+    if not match or not is_valid_email(match.group(0)):
+        return notes, ""
+
+    before = _EMAIL_LABEL_RE.sub("", notes[: match.start()])
+    after = notes[match.end():]
+    cleaned = f"{before.rstrip()} {after.lstrip()}"
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,;:-")
+    return cleaned, match.group(0).lower()
 
 
 def parse_json_object(raw_text: str) -> dict | None:
@@ -244,6 +290,11 @@ class MemoryManager:
                     merged = self._empty_state()
                     merged.update(loaded)
                     self._state = merged
+                    # Self-heal any person whose address is stranded in their
+                    # notes (an older extraction, before the field was lifted
+                    # at merge time) into the structured email field.
+                    if self._normalize_people_emails_locked():
+                        self._write_locked()
                     logger.success(f"Memory loaded from {_MEMORY_FILE}.")
                     return
                 except (ValueError, OSError) as exc:
@@ -387,10 +438,21 @@ class MemoryManager:
         if not people:
             return ""
         people_bits = "; ".join(
-            f"{p.get('name', '?')} ({p.get('notes', '')})" if p.get("notes") else p.get("name", "?")
-            for p in people
+            MemoryManager._format_person(p) for p in people
         )
         return f"Key people: {people_bits}"
+
+    @staticmethod
+    def _format_person(person: dict) -> str:
+        """`Name (notes) <email>`, omitting whichever parts are absent. The
+        address is included so plain Claude can answer "what's Sarah's email?"
+        from real data instead of confabulating one."""
+        rendered = person.get("name", "?")
+        if person.get("notes"):
+            rendered += f" ({person['notes']})"
+        if person.get("email"):
+            rendered += f" <{person['email']}>"
+        return rendered
 
     @staticmethod
     def _recency_first_section(label: str, items: list[str], budget: int) -> str:
@@ -647,6 +709,164 @@ class MemoryManager:
         logger.debug(f"update_event_date(): no event matching '{match_description}' - caller should add new.")
         return False
 
+    # ── People ────────────────────────────────────────────────────────────────
+
+    def _upsert_person_locked(
+        self, name: str, notes: str = "", email: str = "", overwrite_email: bool = False
+    ) -> None:
+        """
+        The single place a person entry is created or updated. Assumes
+        self._lock is HELD (same convention as _write_locked) and does not
+        save - the caller owns both.
+
+        Dedup is a case-insensitive name match, unchanged. Notes are appended
+        with "; " when the new note isn't already contained in the old.
+
+        Email is only written when it passes _EMAIL_RE, and only over an empty
+        stored value - unless `overwrite_email` is set, which only the explicit
+        set_person_email() path does. Background extraction never reaches that
+        parameter, so an extracted (i.e. possibly hallucinated) address can
+        never displace one the boss confirmed out loud: memory is what the send
+        flow resolves recipients from, and a wrong address there is a
+        misdirected, unrecallable send.
+
+        When no explicit `email` is given but the `notes` contain a valid
+        address (how background extraction surfaces one, since its prompt has
+        no email field), it is lifted out of the notes into the field. This
+        never overwrites a stored address - it fills an empty slot only - so
+        the same guard holds.
+        """
+        name = _clean_str(name)
+        if not name:
+            return
+        notes = _clean_str(notes)
+        email = _clean_str(email)
+        if not email:
+            notes, email = _split_email_from_notes(notes)
+        name_lower = name.lower()
+
+        for existing in self._state.setdefault("people", []):
+            if _clean_str(existing.get("name")).lower() != name_lower:
+                continue
+            old_notes = _clean_str(existing.get("notes"))
+            if notes and notes.lower() not in old_notes.lower():
+                existing["notes"] = f"{old_notes}; {notes}".strip("; ")
+            if email and is_valid_email(email):
+                if overwrite_email or not _clean_str(existing.get("email")):
+                    existing["email"] = email
+            return
+
+        self._state["people"].append({
+            "name": name,
+            "notes": notes,
+            "email": email if (email and is_valid_email(email)) else "",
+        })
+
+    def _normalize_people_emails_locked(self) -> bool:
+        """
+        Lift a stranded address out of any person's notes into their empty
+        email field (see _split_email_from_notes). One-time repair for entries
+        written before the field was populated at merge time. Assumes the lock
+        is held; does not save. Returns True if anything changed.
+
+        Only touches a person whose email field is empty, so a confirmed
+        address is never disturbed.
+        """
+        changed = False
+        for person in self._state.get("people") or []:
+            if _clean_str(person.get("email")):
+                continue
+            new_notes, lifted = _split_email_from_notes(person.get("notes"))
+            if lifted:
+                person["notes"] = new_notes
+                person["email"] = lifted
+                changed = True
+                logger.info(f"Repaired a stranded email in memory for '{person.get('name')}'.")
+        return changed
+
+    def set_person_email(self, name: str, email: str) -> bool:
+        """
+        Store `email` as `name`'s address, creating the person if unknown.
+        Overwrites an existing address, since the only callers are the
+        confirmed voice flow (the boss spelled it out and approved the
+        readback) and the typed dashboard submission - both are the boss
+        explicitly correcting the record.
+
+        Returns False without writing anything when the address is malformed.
+        Routes through _upsert_person_locked, so name dedup and notes-merge
+        behave exactly as they do for background extraction.
+        """
+        name = _clean_str(name)
+        email = _clean_str(email)
+        if not name or not is_valid_email(email):
+            logger.warning(
+                f"set_person_email(): refusing to store an invalid address for '{name}'."
+            )
+            return False
+
+        with self._lock:
+            self._upsert_person_locked(name, email=email, overwrite_email=True)
+            self._write_locked()
+
+        logger.success(f"Contact address saved for '{name}'.")
+        return True
+
+    def find_people_by_name(self, name: str) -> list[dict]:
+        """
+        Look up stored people by a spoken name. Returns copies (callers must
+        not mutate the live list). More than one result means the caller must
+        ask the boss which person they meant.
+
+        Resolution is deterministic, in three stages, stopping at the first
+        that produces anything:
+
+        1. Exact case-insensitive full-name match. Exactly one such person
+           wins OUTRIGHT - a bare "Michael" resolves to the person literally
+           named "Michael" with no clarifying question, even though "Michael
+           Heckin" is also stored.
+        2. Anchored per-token prefix: every query token prefixes the name
+           token in the same position. "Michael H" -> "Michael Heckin";
+           "Mich" -> both Michaels (so the caller asks); "Michael" with no
+           bare-"Michael" entry -> every Michael.
+        3. Surname fallback for a single-token query that prefixed nothing:
+           any name containing it as a whole token. "Heckin" -> "Michael
+           Heckin".
+
+        A loose match is safe here: the recipient's name AND address are read
+        back for explicit confirmation before anything is sent.
+        """
+        query = _clean_str(name).lower()
+        if not query:
+            return []
+
+        with self._lock:
+            people = [dict(p) for p in self._state.get("people") or []]
+
+        exact = [p for p in people if _clean_str(p.get("name")).lower() == query]
+        if len(exact) == 1:
+            return exact
+
+        query_tokens = query.split()
+
+        def token_prefix_match(person: dict) -> bool:
+            name_tokens = _clean_str(person.get("name")).lower().split()
+            if len(query_tokens) > len(name_tokens):
+                return False
+            return all(
+                name_tokens[i].startswith(token) for i, token in enumerate(query_tokens)
+            )
+
+        prefixed = [p for p in people if token_prefix_match(p)]
+        if prefixed:
+            return prefixed
+
+        if len(query_tokens) == 1:
+            return [
+                p for p in people
+                if query in _clean_str(p.get("name")).lower().split()
+            ]
+        return exact
+
     def classify_same_or_new(self, answer_text: str) -> str:
         """
         Interpret the boss's spoken answer to the "same event, or new?"
@@ -802,30 +1022,20 @@ class MemoryManager:
     def _merge_extracted(self, extracted: dict) -> None:
         """Merge newly-extracted people/events/facts into self._state, deduplicating, then save."""
         with self._lock:
-            existing_people = self._state.setdefault("people", [])
+            self._state.setdefault("people", [])
             existing_events = self._state.setdefault("events", [])
             existing_facts = self._state.setdefault("facts", [])
 
-            # People: dedup by case-insensitive name match; merge notes on repeat.
-            existing_names_lower = {_clean_str(p.get("name")).lower() for p in existing_people}
+            # People: dedup by case-insensitive name match; merge notes on
+            # repeat. `email` is deliberately never passed - the extraction
+            # prompt doesn't know the field exists, so the model cannot invent
+            # an address that a later send would deliver to.
             for person in extracted["people"]:
                 if not isinstance(person, dict):
                     continue
-                name = _clean_str(person.get("name"))
-                if not name:
-                    continue
-                name_lower = name.lower()
-                if name_lower in existing_names_lower:
-                    for existing in existing_people:
-                        if _clean_str(existing.get("name")).lower() == name_lower:
-                            new_notes = _clean_str(person.get("notes"))
-                            old_notes = _clean_str(existing.get("notes"))
-                            if new_notes and new_notes.lower() not in old_notes.lower():
-                                existing["notes"] = f"{old_notes}; {new_notes}".strip("; ")
-                            break
-                else:
-                    existing_people.append({"name": name, "notes": _clean_str(person.get("notes"))})
-                    existing_names_lower.add(name_lower)
+                self._upsert_person_locked(
+                    _clean_str(person.get("name")), notes=_clean_str(person.get("notes"))
+                )
 
             # Events: update in place when the model flags an update (matched by
             # exact existing-description key), else fall back to exact-description

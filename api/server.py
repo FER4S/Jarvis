@@ -6,9 +6,11 @@
 import asyncio
 import html
 import secrets
+import smtplib
 import threading
 from typing import Dict, Any, Optional, Set
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse, parse_qs
 
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +23,7 @@ from pydantic import BaseModel, Field
 
 from core.assistant import JarvisAssistant
 from core.email_manager import OAUTH_STATE_TTL_S
+from core.memory import is_valid_email
 import config
 
 # Global singleton assistant
@@ -208,8 +211,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
-    # Requested now (unused until a future sending feature ships) so
-    # connected accounts won't need re-consent later.
+    # Used by core/email_send.py's GmailSender. Requested from the very first
+    # version of this flow, so every already-connected account can send
+    # without re-consenting.
     "https://www.googleapis.com/auth/gmail.send",
 ]
 
@@ -227,6 +231,18 @@ class ImapAccountRequest(BaseModel):
     username: str = Field(min_length=1)
     password: str = Field(min_length=1)
     use_ssl: bool = True
+    # Outgoing (SMTP) settings, all optional. Left unset, the outgoing host is
+    # derived from `host` at send time (imap.x.com -> smtp.x.com:465), so an
+    # account added for reading needs no changes to start sending. When
+    # smtp_host IS given, the SMTP login is validated live before storing.
+    smtp_host: Optional[str] = None
+    smtp_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    smtp_use_ssl: bool = True
+
+
+class ContactEmailRequest(BaseModel):
+    """A recipient's address, typed into the dashboard instead of spoken."""
+    email: str = Field(min_length=3, max_length=254)
 
 
 def _sanitize_imap_error(exc: Exception) -> str:
@@ -235,6 +251,10 @@ def _sanitize_imap_error(exc: Exception) -> str:
     the raw exception text (which can include IMAP server banners) back in
     an API response or a log line.
     """
+    if isinstance(exc, smtplib.SMTPAuthenticationError):
+        return "The outgoing mail server rejected the username and password."
+    if isinstance(exc, smtplib.SMTPException):
+        return "Could not connect with the given SMTP settings."
     if isinstance(exc, IMAPClientError):
         return "Login failed — check the username and password."
     if isinstance(exc, OSError):  # socket timeouts, DNS failures, TLS errors, refused connections
@@ -262,20 +282,75 @@ def _build_oauth_flow() -> Flow:
     return flow
 
 
+def _authorization_url_has_scopes(url: str) -> bool:
+    """
+    True only if the generated consent URL actually carries a non-empty
+    `scope` query param containing every scope in GMAIL_SCOPES. Guards against
+    ever handing Google (or the frontend) a URL that would fail with "Missing
+    required parameter: scope" - a silent, confusing failure mode that a
+    dependency upgrade or refactor could otherwise reintroduce.
+    """
+    scope_values = parse_qs(urlparse(url).query).get("scope")
+    if not scope_values:
+        return False
+    return all(scope in scope_values[0] for scope in GMAIL_SCOPES)
+
+
 @app.post("/email/accounts/imap", tags=["email"], dependencies=[Depends(require_token)])
 async def add_imap_account(request: ImapAccountRequest) -> Dict[str, Any]:
     """Adds a Hostinger-style (or any standard) IMAP account. Validates the
-    connection live before storing - never persists unreachable credentials."""
+    connection live before storing - never persists unreachable credentials.
+    An explicitly-supplied smtp_host is validated too; a derived one is not
+    (see EmailManager.add_imap_account)."""
     try:
         account = await asyncio.to_thread(
             email_manager.add_imap_account,
             request.label, request.host, request.port,
             request.username, request.password, request.use_ssl,
+            request.smtp_host, request.smtp_port, request.smtp_use_ssl,
         )
     except Exception as exc:
         logger.warning(f"IMAP account validation failed for host '{request.host}': {type(exc).__name__}")
         raise HTTPException(status_code=400, detail=_sanitize_imap_error(exc))
     return {"account": account}
+
+
+# ── Typed recipient addresses ────────────────────────────────────────────────
+# When the voice send flow needs an address it doesn't have, it asks aloud and
+# opens a pending request. The boss can answer by speaking it (the default) or,
+# because email addresses are hard for STT to get right, by typing it here.
+# This path is strictly optional: the voice flow never waits on it, and works
+# identically if the dashboard is closed.
+
+@app.get("/email/pending-contact", tags=["email"], dependencies=[Depends(require_token)])
+async def get_pending_contact() -> Dict[str, Any]:
+    """Whether Jarvis is currently waiting on a contact's email address, and
+    for whom. Lets the dashboard show an input box in response to the
+    `contact_email_requested` WebSocket event (or by polling)."""
+    return {"pending": email_manager.get_contact_request()}
+
+
+@app.post("/email/pending-contact", tags=["email"], status_code=202,
+          dependencies=[Depends(require_token)])
+async def submit_pending_contact(request: ContactEmailRequest) -> Dict[str, str]:
+    """
+    Fulfil the open address request with a typed address. The voice loop claims
+    it on its next round. Submitting again before it's claimed replaces the
+    value, so a typo caught in time does the right thing.
+
+    400 when the address is malformed; 409 when nothing is pending (or it
+    expired). Shape is checked first so the two are never confused by a request
+    that expires between a check and a submit. Note this never sends anything
+    by itself - the drafted email is still read back in full and explicitly
+    confirmed out loud.
+    """
+    if not is_valid_email(request.email):
+        raise HTTPException(status_code=400, detail="That doesn't look like a valid email address.")
+    if not email_manager.submit_contact_email(request.email):
+        raise HTTPException(
+            status_code=409, detail="Jarvis isn't waiting for a contact's email address."
+        )
+    return {"status": "accepted"}
 
 
 @app.get("/email/accounts/gmail/oauth-url", tags=["email"], dependencies=[Depends(require_token)])
@@ -296,6 +371,16 @@ async def gmail_oauth_url() -> Dict[str, Any]:
     # prompt=consent is load-bearing: Google omits refresh_token on repeat
     # consents without it, and a refresh token is the whole point.
     auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent", state=state)
+    # Fail loud and local if the URL somehow lacks its scopes, rather than
+    # letting Google reject it downstream with a confusing "Missing required
+    # parameter: scope". A no-op on correct output (the normal case).
+    if not _authorization_url_has_scopes(auth_url):
+        logger.error("Generated Gmail OAuth URL is missing scopes — refusing to return it.")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to build a valid Google consent URL (scopes missing). "
+            "Check the google-auth-oauthlib / oauthlib install.",
+        )
     return {"url": auth_url, "expires_in": int(OAUTH_STATE_TTL_S)}
 
 
@@ -348,7 +433,12 @@ async def gmail_oauth_callback(state: str = "", code: str = "", error: str = "")
     try:
         message = await asyncio.to_thread(_exchange_and_store)
     except Exception as exc:
-        logger.warning(f"Gmail OAuth exchange failed: {type(exc).__name__}")
+        # Log the full error detail (type + message) for the operator: a bare
+        # exception name is useless for diagnosing setup issues. Google's
+        # HttpError message here is setup guidance (e.g. "Gmail API has not
+        # been used in project N before or it is disabled … enable it by
+        # visiting <link>"), not a secret — it carries no auth code or token.
+        logger.warning(f"Gmail OAuth exchange failed: {type(exc).__name__}: {exc}")
         return HTMLResponse(
             _OAUTH_RESULT_HTML.format(message="Something went wrong connecting your Gmail account. Please try again."),
             status_code=400,

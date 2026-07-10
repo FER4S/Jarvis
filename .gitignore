@@ -35,6 +35,9 @@ models/openwakeword/
 # Jarvis persistent memory store (local, per-machine, personal data)
 data/
 
+# Local throwaway verification / scratch scripts
+scratchpad/
+
 # OS
 .DS_Store
 Thumbs.db
